@@ -1,0 +1,20 @@
+# gradle
+.gradle/
+build/
+run/
+gradle-local.properties
+
+# ide
+.idea/
+*.iml
+.vscode/
+
+# logs & crash
+*.log
+run/crash-reports/
+
+# local backups & temp
+*.bak
+*.bak18
+decoded_*.txt
+hs_err_pid*.log

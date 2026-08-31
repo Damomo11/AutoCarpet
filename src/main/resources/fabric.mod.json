@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "autocarpet",
+  "version": "1.0.0-26.1.2",
+  "name": "AutoCarpetMaps",
+  "description": "Auto carpet- printing from litematica schematics, map crafting, locking and anvil naming.",
+  "authors": [
+    "Damomo1"
+  ],
+  "icon": "assets/autocarpet/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.autocarpet.AutoCarpet"
+    ],
+    "modmenu": [
+      "com.autocarpet.integration.ModMenuIntegration"
+    ]
+  },
+  "mixins": [
+    "autocarpet-internal.mixins.json",
+    "autocarpet.mixins.json"
+  ],
+  "depends": {
+    "java": ">=25",
+    "minecraft": "~26.1",
+    "litematica": "*"
+  },
+  "suggests": {
+    "malilib": "*",
+    "modmenu": "*"
+  }
+}
