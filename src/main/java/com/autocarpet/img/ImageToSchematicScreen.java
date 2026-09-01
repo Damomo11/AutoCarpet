@@ -65,7 +65,9 @@ public class ImageToSchematicScreen extends Screen {
     private int previewSize;
     private int imgDrawX;
     private int imgDrawY;
-    private double imgScale;
+    private int imgDrawWidth;
+    private int imgDrawHeight;
+    private double dispScale;   // 屏幕像素 / 图片像素
 
     // ---- 拖选 ----
     private boolean dragging;
@@ -295,12 +297,12 @@ public class ImageToSchematicScreen extends Screen {
 
     /** 图片在面板内的绘制矩形 (等比缩放居中) */
     private void updateImageRect() {
-        if (this.thumbWidth <= 0) return;
-        this.imgScale = Math.min(this.previewSize / (double) this.thumbWidth, this.previewSize / (double) this.thumbHeight);
-        int w = (int) Math.round(this.thumbWidth * this.imgScale);
-        int h = (int) Math.round(this.thumbHeight * this.imgScale);
-        this.imgDrawX = this.previewX + (this.previewSize - w) / 2;
-        this.imgDrawY = this.previewY + (this.previewSize - h) / 2;
+        if (this.imgWidth <= 0 || this.imgHeight <= 0) return;
+        this.dispScale = Math.min(this.previewSize / (double) this.imgWidth, this.previewSize / (double) this.imgHeight);
+        this.imgDrawWidth = Math.max(1, (int) Math.round(this.imgWidth * this.dispScale));
+        this.imgDrawHeight = Math.max(1, (int) Math.round(this.imgHeight * this.dispScale));
+        this.imgDrawX = this.previewX + (this.previewSize - this.imgDrawWidth) / 2;
+        this.imgDrawY = this.previewY + (this.previewSize - this.imgDrawHeight) / 2;
     }
 
     /** 自动取图中心的正方形选区, 边长 = 边长框的值 (不超过图片) */
@@ -402,8 +404,8 @@ public class ImageToSchematicScreen extends Screen {
     /** GUI 坐标 -> 图片像素坐标 (取不到时返回 null) */
     private int[] toImagePixel(double mouseX, double mouseY) {
         if (this.pixels == null) return null;
-        int fx = (int) Math.floor((mouseX - this.imgDrawX) / this.imgScale);
-        int fy = (int) Math.floor((mouseY - this.imgDrawY) / this.imgScale);
+        int fx = (int) Math.floor((mouseX - this.imgDrawX) / this.dispScale);
+        int fy = (int) Math.floor((mouseY - this.imgDrawY) / this.dispScale);
         fx = Math.max(0, Math.min(this.imgWidth - 1, fx));
         fy = Math.max(0, Math.min(this.imgHeight - 1, fy));
         return new int[]{fx, fy};
@@ -514,18 +516,20 @@ public class ImageToSchematicScreen extends Screen {
     /** 整张预览一次 blit (贴图已含底色) */
     private void drawImage(GuiGraphicsExtractor graphics) {
         if (this.previewTextureId == null) return;
-        int drawWidth = Math.max(1, (int) Math.round(this.thumbWidth * this.imgScale));
-        int drawHeight = Math.max(1, (int) Math.round(this.thumbHeight * this.imgScale));
-        graphics.blit(this.previewTextureId, this.imgDrawX, this.imgDrawY, drawWidth, drawHeight,
-                0.0f, 0.0f, 1.0f, 1.0f);
+        graphics.blit(net.minecraft.client.renderer.RenderPipelines.GUI_TEXTURED,
+                this.previewTextureId,
+                this.imgDrawX, this.imgDrawY,
+                0.0f, 0.0f,
+                this.imgDrawWidth, this.imgDrawHeight,
+                this.thumbWidth, this.thumbHeight);
     }
 
     /** 选区高亮框 */
     private void drawSelection(GuiGraphicsExtractor graphics) {
         if (this.selSize < 1) return;
-        int x = this.imgDrawX + (int) Math.round(this.selX * this.imgScale);
-        int y = this.imgDrawY + (int) Math.round(this.selY * this.imgScale);
-        int w = Math.max(2, (int) Math.round(this.selSize * this.imgScale));
+        int x = this.imgDrawX + (int) Math.round(this.selX * this.dispScale);
+        int y = this.imgDrawY + (int) Math.round(this.selY * this.dispScale);
+        int w = Math.max(2, (int) Math.round(this.selSize * this.dispScale));
         graphics.outline(x, y, w, w, 0xFFFFFFFF);
     }
 
