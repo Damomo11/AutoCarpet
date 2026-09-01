@@ -7,6 +7,8 @@ import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.input.MouseButtonEvent;
+import net.minecraft.client.renderer.texture.DynamicTexture;
+import net.minecraft.resources.Identifier;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.FormattedText;
 import org.lwjgl.glfw.GLFW;
@@ -69,6 +71,13 @@ public class ImageToSchematicScreen extends Screen {
     private boolean dragging;
     private int dragAnchorX;
     private int dragAnchorY;
+    private boolean dragMove;    // true=移动已有选区, false=框选新选区
+    private int grabOffsetX;
+    private int grabOffsetY;
+
+    // ---- 预览 GPU 贴图 (1 次 blit/帧, 替代逐像素 fill) ----
+    private DynamicTexture previewTexture;
+    private Identifier previewTextureId;
 
     // ---- 生成结果 ----
     private PixelArtGenerator.Result lastResult;
@@ -148,46 +157,64 @@ public class ImageToSchematicScreen extends Screen {
     // ==================================================================
 
     private void pasteFromClipboard() {
-        try {
-            Clipboard clipboard = java.awt.Toolkit.getDefaultToolkit().getSystemClipboard();
-            if (!clipboard.isDataFlavorAvailable(DataFlavor.imageFlavor)) {
-                this.setStatus("剪贴板中没有图片", 0xFFFF5555);
-                return;
+        Thread worker = new Thread(() -> {
+            try {
+                java.awt.Toolkit toolkit = java.awt.Toolkit.getDefaultToolkit();
+                Clipboard clipboard = toolkit.getSystemClipboard();
+                if (!clipboard.isDataFlavorAvailable(DataFlavor.imageFlavor)) {
+                    this.minecraft.execute(() -> this.setStatus("剪贴板中没有图片", 0xFFFF5555));
+                    return;
+                }
+                Object data = clipboard.getData(DataFlavor.imageFlavor);
+                if (!(data instanceof Image image) || image.getWidth(null) <= 0 || image.getHeight(null) <= 0) {
+                    this.minecraft.execute(() -> this.setStatus("剪贴板图片无效", 0xFFFF5555));
+                    return;
+                }
+                BufferedImage buffered = toBufferedImage(image);
+                String name = "momomap_" + TIME_FORMAT.format(LocalDateTime.now());
+                this.minecraft.execute(() -> this.loadImage(buffered, name));
+            } catch (Throwable throwable) {
+                String message = throwable.getMessage();
+                if (message == null || message.isBlank()) message = throwable.getClass().getSimpleName();
+                String finalMessage = message;
+                this.minecraft.execute(() -> this.setStatus("粘贴失败: " + finalMessage, 0xFFFF5555));
             }
-            Image image = (Image) clipboard.getData(DataFlavor.imageFlavor);
-            if (image == null || image.getWidth(null) <= 0 || image.getHeight(null) <= 0) {
-                this.setStatus("剪贴板图片无效", 0xFFFF5555);
-                return;
-            }
-            this.loadImage(toBufferedImage(image), "momomap_" + TIME_FORMAT.format(LocalDateTime.now()));
-        } catch (Throwable throwable) {
-            this.setStatus("粘贴失败: " + throwable.getMessage(), 0xFFFF5555);
-        }
+        }, "autocarpet-clipboard");
+        worker.setDaemon(true);
+        worker.start();
     }
 
     private void chooseFile() {
+        Thread worker = new Thread(() -> {
         try {
             java.awt.FileDialog dialog = new java.awt.FileDialog((java.awt.Frame) null, "选择图片", java.awt.FileDialog.LOAD);
             try {
                 dialog.setFilenameFilter((dir, name) -> name.toLowerCase(Locale.ROOT).matches(".*\\.(png|jpe?g|bmp|gif)$"));
             } catch (Throwable ignored) {
             }
-            dialog.setVisible(true);   // 模态, 选完返回
+            dialog.setVisible(true);   // 模态, 选完返回 (后台线程, 不卡渲染)
             String fileName = dialog.getFile();
             if (fileName == null) return;
             File file = new File(dialog.getDirectory(), fileName);
             BufferedImage image = ImageIO.read(file);
-            if (image == null) {
-                this.setStatus("无法解码图片 (支持 png/jpg/bmp/gif)", 0xFFFF5555);
-                return;
-            }
             String base = fileName;
             int dot = base.lastIndexOf('.');
             if (dot > 0) base = base.substring(0, dot);
-            this.loadImage(image, base);
+            String finalBase = base;
+            if (image == null) {
+                this.minecraft.execute(() -> this.setStatus("无法解码图片 (支持 png/jpg/bmp/gif)", 0xFFFF5555));
+                return;
+            }
+            this.minecraft.execute(() -> this.loadImage(image, finalBase));
         } catch (Throwable throwable) {
-            this.setStatus("读取文件失败: " + throwable.getMessage(), 0xFFFF5555);
+            String message = throwable.getMessage();
+            if (message == null || message.isBlank()) message = throwable.getClass().getSimpleName();
+            String finalMessage = message;
+            this.minecraft.execute(() -> this.setStatus("读取文件失败: " + finalMessage, 0xFFFF5555));
         }
+        }, "autocarpet-filedialog");
+        worker.setDaemon(true);
+        worker.start();
     }
 
     /** 统一转成 TYPE_INT_ARGB, 保证 getRGB 拿到统一格式 */
@@ -226,7 +253,38 @@ public class ImageToSchematicScreen extends Screen {
         this.lastResult = null;
         this.fitSelection();
         this.updateImageRect();
+        this.updatePreviewTexture();
         this.setStatus("已载入 " + this.imgWidth + "x" + this.imgHeight + " (拖动鼠标框选正方形)", 0xFF55FF55);
+    }
+
+    /** 把缩略图写入 GPU 贴图: 透明像素预合成到深色底, 整张不透明避免混合问题 */
+    private void updatePreviewTexture() {
+        if (this.thumb == null) return;
+        if (this.previewTexture == null) {
+            this.previewTexture = new DynamicTexture("autocarpet_preview", this.thumbWidth, this.thumbHeight, true);
+            this.previewTextureId = Identifier.fromNamespaceAndPath("autocarpet", "preview");
+            this.minecraft.getTextureManager().register(this.previewTextureId, this.previewTexture);
+        }
+        com.mojang.blaze3d.platform.NativeImage image = this.previewTexture.getPixels();
+        for (int ty = 0; ty < this.thumbHeight; ty++) {
+            for (int tx = 0; tx < this.thumbWidth; tx++) {
+                int argb = this.thumb[ty * this.thumbWidth + tx];
+                int r = (argb >> 16) & 0xFF;
+                int g = (argb >> 8) & 0xFF;
+                int b = argb & 0xFF;
+                if (((argb >>> 24) & 0xFF) < PixelArtGenerator.ALPHA_THRESHOLD) { r = 0x20; g = 0x20; b = 0x20; }
+                image.setPixelABGR(tx, ty, (0xFF << 24) | (b << 16) | (g << 8) | r);
+            }
+        }
+        this.previewTexture.upload();
+    }
+
+    private void releasePreviewTexture() {
+        if (this.previewTextureId != null) {
+            this.minecraft.getTextureManager().release(this.previewTextureId);
+            this.previewTexture = null;
+            this.previewTextureId = null;
+        }
     }
 
     /** 图片在面板内的绘制矩形 (等比缩放居中) */
@@ -285,7 +343,9 @@ public class ImageToSchematicScreen extends Screen {
             PixelArtGenerator.sendStatsToChat(result);
         } catch (Throwable throwable) {
             throwable.printStackTrace();
-            this.setStatus("生成失败: " + throwable.getMessage(), 0xFFFF5555);
+            String message = throwable.getMessage();
+            if (message == null || message.isBlank()) message = throwable.getClass().getSimpleName();
+            this.setStatus("生成失败: " + message, 0xFFFF5555);
         }
     }
 
@@ -313,7 +373,25 @@ public class ImageToSchematicScreen extends Screen {
             this.pasteFromClipboard();
             return true;
         }
+        // 方向键微调选区 (输入框聚焦时交给输入框)
+        int dx = 0;
+        int dy = 0;
+        if (event.key() == GLFW.GLFW_KEY_LEFT) dx = -1;
+        else if (event.key() == GLFW.GLFW_KEY_RIGHT) dx = 1;
+        else if (event.key() == GLFW.GLFW_KEY_UP) dy = -1;
+        else if (event.key() == GLFW.GLFW_KEY_DOWN) dy = 1;
+        if ((dx != 0 || dy != 0) && this.pixels != null && !(this.getFocused() instanceof EditBox)) {
+            this.selX = Math.max(0, Math.min(this.imgWidth - this.selSize, this.selX + dx));
+            this.selY = Math.max(0, Math.min(this.imgHeight - this.selSize, this.selY + dy));
+            return true;
+        }
         return super.keyPressed(event);
+    }
+
+    @Override
+    public void removed() {
+        this.releasePreviewTexture();
+        super.removed();
     }
 
     /** GUI 坐标 -> 图片像素坐标 (取不到时返回 null) */
@@ -331,15 +409,40 @@ public class ImageToSchematicScreen extends Screen {
                 && mouseY >= this.previewY - 2 && mouseY <= this.previewY + this.previewSize + 2;
     }
 
+    /** 鼠标点是否落在当前选区框内 (屏幕坐标) */
+    private boolean inSelectionBox(double mouseX, double mouseY) {
+        if (this.pixels == null || this.selSize < 1) return false;
+        int x1 = this.imgDrawX + (int) Math.round(this.selX * this.imgScale);
+        int y1 = this.imgDrawY + (int) Math.round(this.selY * this.imgScale);
+        int side = Math.max(2, (int) Math.round(this.selSize * this.imgScale));
+        return mouseX >= x1 && mouseX <= x1 + side && mouseY >= y1 && mouseY <= y1 + side;
+    }
+
+    /** 移动选区 (像素坐标为鼠标位置, 保持抓取偏移) */
+    private void moveSelection(int pixelX, int pixelY) {
+        this.selX = Math.max(0, Math.min(this.imgWidth - this.selSize, pixelX - this.grabOffsetX));
+        this.selY = Math.max(0, Math.min(this.imgHeight - this.selSize, pixelY - this.grabOffsetY));
+    }
+
     @Override
     public boolean mouseClicked(MouseButtonEvent event, boolean doubled) {
         if (super.mouseClicked(event, doubled)) return true;
         if (event.button() == 0 && this.pixels != null && this.inPreview(event.x(), event.y())) {
             int[] anchor = this.toImagePixel(event.x(), event.y());
             this.dragging = true;
-            this.dragAnchorX = anchor[0];
-            this.dragAnchorY = anchor[1];
-            this.applyDrag(anchor[0], anchor[1]);
+            if (this.inSelectionBox(event.x(), event.y())) {
+                // 选区内按下: 移动整个选区
+                this.dragMove = true;
+                this.grabOffsetX = anchor[0] - this.selX;
+                this.grabOffsetY = anchor[1] - this.selY;
+                this.moveSelection(anchor[0], anchor[1]);
+            } else {
+                // 选区外按下: 重新框选
+                this.dragMove = false;
+                this.dragAnchorX = anchor[0];
+                this.dragAnchorY = anchor[1];
+                this.applyDrag(anchor[0], anchor[1]);
+            }
             return true;
         }
         return false;
@@ -349,7 +452,11 @@ public class ImageToSchematicScreen extends Screen {
     public boolean mouseDragged(MouseButtonEvent event, double deltaX, double deltaY) {
         if (this.dragging) {
             int[] current = this.toImagePixel(event.x(), event.y());
-            this.applyDrag(current[0], current[1]);
+            if (this.dragMove) {
+                this.moveSelection(current[0], current[1]);
+            } else {
+                this.applyDrag(current[0], current[1]);
+            }
             return true;
         }
         return super.mouseDragged(event, deltaX, deltaY);
@@ -434,21 +541,13 @@ public class ImageToSchematicScreen extends Screen {
         }
     }
 
-    /** 逐像素画缩略图 (小方块, 无插值) */
+    /** 整张预览一次 blit (贴图已含底色) */
     private void drawImage(GuiGraphicsExtractor graphics) {
-        for (int ty = 0; ty < this.thumbHeight; ty++) {
-            int y1 = this.imgDrawY + (int) Math.round(ty * this.imgScale);
-            int y2 = this.imgDrawY + (int) Math.round((ty + 1) * this.imgScale);
-            if (y2 <= y1) y2 = y1 + 1;
-            for (int tx = 0; tx < this.thumbWidth; tx++) {
-                int color = this.thumb[ty * this.thumbWidth + tx];
-                if ((color >>> 24) < PixelArtGenerator.ALPHA_THRESHOLD) continue;   // 透明留底色
-                int x1 = this.imgDrawX + (int) Math.round(tx * this.imgScale);
-                int x2 = this.imgDrawX + (int) Math.round((tx + 1) * this.imgScale);
-                if (x2 <= x1) x2 = x1 + 1;
-                graphics.fill(x1, y1, x2, y2, 0xFF000000 | color);
-            }
-        }
+        if (this.previewTextureId == null) return;
+        int drawWidth = Math.max(1, (int) Math.round(this.thumbWidth * this.imgScale));
+        int drawHeight = Math.max(1, (int) Math.round(this.thumbHeight * this.imgScale));
+        graphics.blit(this.previewTextureId, this.imgDrawX, this.imgDrawY, drawWidth, drawHeight,
+                0.0f, 0.0f, (float) this.thumbWidth, (float) this.thumbHeight);
     }
 
     /** 选区高亮框 */
@@ -462,6 +561,7 @@ public class ImageToSchematicScreen extends Screen {
 
     @Override
     public void onClose() {
+        this.releasePreviewTexture();
         this.minecraft.setScreen(this.parent);
     }
 }

@@ -29,6 +29,8 @@ public class AutoCarpet implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         instance = this;
+        // Fabric 环境下 AWT 默认 headless, 会导致剪贴板图片/文件对话框抛 HeadlessException
+        System.setProperty("java.awt.headless", "false");
         CartographerModule cartographer = new CartographerModule();
         this.modules.add(cartographer);
         this.config = new ConfigManager();
