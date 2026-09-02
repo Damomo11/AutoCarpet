@@ -26,13 +26,15 @@ import java.util.Locale;
 
 /**
  * 图片 -> 地毯投影生成器界面: Ctrl+V 粘贴或选择文件载入图片,
- * 拖选正方形选区 (边长 16-256 可设, 默认 128), 最近颜色映射为 16 色地毯,
- * 生成单层纯地毯 .litematic 直接写入 schematics/momomap (进入制图队列)。
+ * 拖选正方形选区 (边长固定 128), 最近颜色映射为 16 色地毯,
+ * 按选择框宽×高生成多个单层纯地毯 .litematic 直接写入 schematics/momomap (进入制图队列)。
  */
 public class ImageToSchematicScreen extends Screen {
-    private static final int MIN_SIZE = 16;
-    private static final int MAX_SIZE = 256;
+    private static final int MIN_SIZE = 128;
+    private static final int MAX_SIZE = 128;
     private static final int DEFAULT_SIZE = 128;
+    private static final int MIN_TILES = 1;
+    private static final int MAX_TILES = 16;
     /** 预览缩略图最大边长 (避免每帧逐像素 fill 过多) */
     private static final int THUMB_MAX = 160;
     private static final DateTimeFormatter TIME_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss", Locale.ROOT);
@@ -54,10 +56,16 @@ public class ImageToSchematicScreen extends Screen {
 
     // ---- 控件 ----
     private EditBox sizeBox;
+    private EditBox columnsBox;
+    private EditBox rowsBox;
     private EditBox nameBox;
     private String sizeText = String.valueOf(DEFAULT_SIZE);
+    private String columnsText = "1";
+    private String rowsText = "1";
     private String nameText = "";
     private int targetSize = DEFAULT_SIZE;
+    private int tileColumns = 1;
+    private int tileRows = 1;
 
     // ---- 布局 ----
     private int previewX;
@@ -79,7 +87,7 @@ public class ImageToSchematicScreen extends Screen {
     private Identifier previewTextureId;
 
     // ---- 生成结果 ----
-    private PixelArtGenerator.Result lastResult;
+    private PixelArtGenerator.BatchResult lastResult;
     private String status = "Ctrl+V 粘贴图片, 或点击[选择文件]";
     private int statusColor = 0xFFAAAAAA;
 
@@ -90,6 +98,10 @@ public class ImageToSchematicScreen extends Screen {
 
     @Override
     protected void init() {
+        this.tileColumns = MIN_TILES;
+        this.tileRows = MIN_TILES;
+        this.columnsText = String.valueOf(this.tileColumns);
+        this.rowsText = String.valueOf(this.tileRows);
         int contentTop = 44;
         this.addRenderableWidget(Button.builder(Component.literal("粘贴图片"), b -> this.pasteFromClipboard())
                 .bounds(this.width / 2 - 102, 20, 100, 20).build());
@@ -108,23 +120,36 @@ public class ImageToSchematicScreen extends Screen {
         this.sizeBox = new EditBox(this.font, rx + 32, 44, 60, 18, Component.literal("边长"));
         this.sizeBox.setMaxLength(3);
         this.sizeBox.setValue(this.sizeText);
-        this.sizeBox.setResponder(value -> {
-            this.sizeText = value;
-            try {
-                this.targetSize = Math.max(MIN_SIZE, Math.min(MAX_SIZE, Integer.parseInt(value.trim())));
-            } catch (NumberFormatException ignored) {
-            }
-        });
+        this.sizeBox.setEditable(false);
         this.addRenderableWidget(this.sizeBox);
-        this.addRenderableWidget(Button.builder(Component.literal("−"), b -> this.adjustSize(-8))
+        this.addRenderableWidget(Button.builder(Component.literal("−"), b -> { })
                 .bounds(rx + 96, 44, 20, 18).build());
-        this.addRenderableWidget(Button.builder(Component.literal("+"), b -> this.adjustSize(8))
+        this.addRenderableWidget(Button.builder(Component.literal("+"), b -> { })
                 .bounds(rx + 118, 44, 20, 18).build());
 
-        this.addRenderableWidget(Button.builder(Component.literal("适应边长"), b -> this.fitSelection())
-                .bounds(rx, 66, 110, 18).build());
+        this.columnsBox = this.tileBox("选择框宽", this.columnsText, rx + 32, 66, value -> {
+            this.columnsText = value;
+            this.tileColumns = parseTileCount(value, this.tileColumns);
+        });
+        this.rowsBox = this.tileBox("选择框高", this.rowsText, rx + 32, 88, value -> {
+            this.rowsText = value;
+            this.tileRows = parseTileCount(value, this.tileRows);
+        });
+        this.addRenderableWidget(this.columnsBox);
+        this.addRenderableWidget(this.rowsBox);
+        this.addRenderableWidget(Button.builder(Component.literal("宽 −"), b -> this.adjustTiles(true, -1))
+                .bounds(rx + 96, 66, 38, 18).build());
+        this.addRenderableWidget(Button.builder(Component.literal("宽 +"), b -> this.adjustTiles(true, 1))
+                .bounds(rx + 136, 66, 38, 18).build());
+        this.addRenderableWidget(Button.builder(Component.literal("高 −"), b -> this.adjustTiles(false, -1))
+                .bounds(rx + 96, 88, 38, 18).build());
+        this.addRenderableWidget(Button.builder(Component.literal("高 +"), b -> this.adjustTiles(false, 1))
+                .bounds(rx + 136, 88, 38, 18).build());
 
-        this.nameBox = new EditBox(this.font, rx, 100, rw, 18, Component.literal("名称"));
+        this.addRenderableWidget(Button.builder(Component.literal("适应整图"), b -> this.fitSelection())
+                .bounds(rx, 110, 110, 18).build());
+
+        this.nameBox = new EditBox(this.font, rx, 134, rw, 18, Component.literal("名称"));
         this.nameBox.setMaxLength(64);
         this.nameBox.setValue(this.nameText);
         this.nameBox.setResponder(value -> this.nameText = value);
@@ -132,7 +157,7 @@ public class ImageToSchematicScreen extends Screen {
         this.addRenderableWidget(this.nameBox);
 
         this.addRenderableWidget(Button.builder(Component.literal("生成投影"), b -> this.generate())
-                .bounds(rx, 124, rw, 20).build());
+                .bounds(rx, 158, rw, 20).build());
 
         this.addRenderableWidget(Button.builder(Component.literal("返回"), b -> this.onClose())
                 .bounds(this.width / 2 - 45, this.height - 27, 90, 20).build());
@@ -140,19 +165,38 @@ public class ImageToSchematicScreen extends Screen {
     }
 
     private void adjustSize(int delta) {
-        int size = this.targetSize + delta;
-        try {
-            size = Integer.parseInt(this.sizeText.trim()) + delta;
-        } catch (NumberFormatException ignored) {
-        }
-        size = Math.max(MIN_SIZE, Math.min(MAX_SIZE, size));
-        this.targetSize = size;
-        this.sizeText = String.valueOf(size);
-        this.sizeBox.setValue(this.sizeText);
-        this.applySelectionSize();
+        // 单片投影固定为 128×128, 保留方法以兼容旧状态与配置布局。
     }
 
-    /** 选区大小固定 = 边长设置 (夹到图片内), 位置保持并夹回 */
+    private EditBox tileBox(String label, String value, int x, int y, java.util.function.Consumer<String> responder) {
+        EditBox box = new EditBox(this.font, x, y, 60, 18, Component.literal(label));
+        box.setMaxLength(2);
+        box.setValue(value);
+        box.setResponder(responder);
+        return box;
+    }
+
+    private static int parseTileCount(String value, int fallback) {
+        try {
+            return Math.max(MIN_TILES, Math.min(MAX_TILES, Integer.parseInt(value.trim())));
+        } catch (NumberFormatException ignored) {
+            return fallback;
+        }
+    }
+
+    private void adjustTiles(boolean columns, int delta) {
+        if (columns) {
+            this.tileColumns = Math.max(MIN_TILES, Math.min(MAX_TILES, this.tileColumns + delta));
+            this.columnsText = String.valueOf(this.tileColumns);
+            if (this.columnsBox != null) this.columnsBox.setValue(this.columnsText);
+        } else {
+            this.tileRows = Math.max(MIN_TILES, Math.min(MAX_TILES, this.tileRows + delta));
+            this.rowsText = String.valueOf(this.tileRows);
+            if (this.rowsBox != null) this.rowsBox.setValue(this.rowsText);
+        }
+    }
+
+    /** 选区仅作为预览辅助; 实际生成始终使用整张图片。 */
     private void applySelectionSize() {
         if (this.pixels == null) return;
         this.selSize = Math.max(1, Math.min(this.targetSize, Math.min(this.imgWidth, this.imgHeight)));
@@ -268,7 +312,10 @@ public class ImageToSchematicScreen extends Screen {
     /** 把缩略图写入 GPU 贴图: 透明像素预合成到深色底, 整张不透明避免混合问题 */
     private void updatePreviewTexture() {
         if (this.thumb == null) return;
-        if (this.previewTexture == null) {
+        if (this.previewTexture == null
+                || this.previewTexture.getPixels().getWidth() != this.thumbWidth
+                || this.previewTexture.getPixels().getHeight() != this.thumbHeight) {
+            this.releasePreviewTexture();
             this.previewTexture = new DynamicTexture("autocarpet_preview", this.thumbWidth, this.thumbHeight, true);
             this.previewTextureId = Identifier.fromNamespaceAndPath("autocarpet", "preview");
             this.minecraft.getTextureManager().register(this.previewTextureId, this.previewTexture);
@@ -337,16 +384,15 @@ public class ImageToSchematicScreen extends Screen {
             return;
         }
         try {
-            PixelArtGenerator.Result result = PixelArtGenerator.generate(
-                    this.pixels, this.imgWidth, this.imgHeight, this.selX, this.selY, this.selSize, this.targetSize);
-            if (result.totalBlocks == 0) {
-                this.setStatus("选区全是透明像素, 没有可打印内容", 0xFFFF5555);
+            PixelArtGenerator.BatchResult result = PixelArtGenerator.generateTiledAndWrite(
+                    this.pixels, this.imgWidth, this.imgHeight, this.tileColumns, this.tileRows, DEFAULT_SIZE, name);
+            if (result.totalBlocks == 0 || result.paths.isEmpty()) {
+                this.setStatus("图片没有可打印内容 (全部透明)", 0xFFFF5555);
                 return;
             }
-            java.nio.file.Path path = PixelArtGenerator.writeSchematic(name, result);
             this.lastResult = result;
-            this.setStatus("已生成 " + path.getFileName() + " (已加入队列)", 0xFF55FF55);
-            Chat.info("投影已生成: %s.litematic（已加入队列）", name);
+            this.setStatus("已生成 " + result.count() + " 张投影 (已加入队列, 按时间顺序处理)", 0xFF55FF55);
+            Chat.info("投影已生成: %s, 共%s张（已加入队列）", name, result.count());
             PixelArtGenerator.sendStatsToChat(result);
         } catch (Throwable throwable) {
             throwable.printStackTrace();
@@ -475,7 +521,7 @@ public class ImageToSchematicScreen extends Screen {
             this.drawSelection(graphics);
             // 选区信息条 (面板底部)
             graphics.fill(this.previewX, py2 - 12, px2, py2, 0xA0000000);
-            String info = "选区 " + this.selSize + "x" + this.selSize + " (" + this.selX + "," + this.selY + ") -> " + this.targetSize + "x" + this.targetSize;
+            String info = "整图等比适配 | " + this.tileColumns + "×" + this.tileRows + " 张 | 每张128×128";
             graphics.centeredText(this.font, info, (this.previewX + px2) / 2, py2 - 10, 0xFFFFFF);
         } else {
             String[] hints = {"Ctrl+V 粘贴图片", "或点击[选择文件]"};
@@ -487,8 +533,12 @@ public class ImageToSchematicScreen extends Screen {
         // ---- 右侧标签 ----
         int rx = this.previewX + this.previewSize + 8;
         graphics.text(this.font, "边长", rx, 48, 0xFFCCCCCC);
-        graphics.text(this.font, MIN_SIZE + "-" + MAX_SIZE, rx + 142, 48, 0xFF888888);
-        graphics.text(this.font, "名称", rx, 89, 0xFFCCCCCC);
+        graphics.text(this.font, "固定128", rx + 142, 48, 0xFF888888);
+        graphics.text(this.font, "选择框宽", rx, 70, 0xFFCCCCCC);
+        graphics.text(this.font, "范围 1–" + MAX_TILES, rx + 176, 70, 0xFF888888);
+        graphics.text(this.font, "选择框高", rx, 92, 0xFFCCCCCC);
+        graphics.text(this.font, "范围 1–" + MAX_TILES, rx + 176, 92, 0xFF888888);
+        graphics.text(this.font, "名称", rx, 123, 0xFFCCCCCC);
         // 状态信息
         if (this.status != null && !this.status.isEmpty()) {
             graphics.textWithWordWrap(this.font, FormattedText.of(this.status), rx, 150, Math.max(120, this.width - rx - 8), this.statusColor);
@@ -521,10 +571,11 @@ public class ImageToSchematicScreen extends Screen {
                 this.imgDrawX, this.imgDrawY,
                 0.0f, 0.0f,
                 this.imgDrawWidth, this.imgDrawHeight,
+                this.thumbWidth, this.thumbHeight,
                 this.thumbWidth, this.thumbHeight);
     }
 
-    /** 选区高亮框 */
+    /** 选区高亮框仅用于预览, 生成时采用整图 */
     private void drawSelection(GuiGraphicsExtractor graphics) {
         if (this.selSize < 1) return;
         int x = this.imgDrawX + (int) Math.round(this.selX * this.dispScale);

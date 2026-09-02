@@ -10,6 +10,8 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.block.state.BlockState;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * 像素画 -> 单层纯地毯投影:
@@ -37,6 +39,83 @@ public final class PixelArtGenerator {
             this.size = size;
             this.states = new BlockState[size * size];
         }
+    }
+
+    /** 多投影生成结果, 统计为所有分片合计。 */
+    public static class BatchResult {
+        public final List<Path> paths;
+        public final int[] counts = new int[CarpetPalette.SIZE];
+        public int totalBlocks;
+
+        private BatchResult(List<Path> paths) {
+            this.paths = paths;
+        }
+
+        public int count() {
+            return this.paths.size();
+        }
+    }
+
+    /**
+     * 按完整图片比例适配到 columns*tileSize × rows*tileSize 画布，并按行列写出投影。
+     * 图片不会裁剪；等比缩放后居中，画布空白处为空气。每片始终为完整 tileSize 方块。
+     */
+    public static BatchResult generateTiledAndWrite(int[] pixels, int imgWidth, int imgHeight,
+                                                      int columns, int rows, int tileSize, String baseName) {
+        if (pixels == null || imgWidth <= 0 || imgHeight <= 0) throw new IllegalArgumentException("图片尺寸无效");
+        if (columns < 1 || rows < 1 || tileSize < 1) throw new IllegalArgumentException("投影网格参数无效");
+        int canvasWidth = Math.multiplyExact(columns, tileSize);
+        int canvasHeight = Math.multiplyExact(rows, tileSize);
+        double scale = Math.min((double) canvasWidth / imgWidth, (double) canvasHeight / imgHeight);
+        int scaledWidth = Math.max(1, Math.min(canvasWidth, (int) Math.round(imgWidth * scale)));
+        int scaledHeight = Math.max(1, Math.min(canvasHeight, (int) Math.round(imgHeight * scale)));
+        int offsetX = (canvasWidth - scaledWidth) / 2;
+        int offsetY = (canvasHeight - scaledHeight) / 2;
+
+        List<Path> paths = new ArrayList<>(columns * rows);
+        BatchResult batch = new BatchResult(paths);
+        List<Result> results = new ArrayList<>(columns * rows);
+        for (int row = 0; row < rows; row++) {
+            for (int column = 0; column < columns; column++) {
+                Result result = generateTile(pixels, imgWidth, imgHeight, column * tileSize, row * tileSize,
+                        tileSize, scaledWidth, scaledHeight, offsetX, offsetY);
+                results.add(result);
+                for (int i = 0; i < CarpetPalette.SIZE; i++) batch.counts[i] += result.counts[i];
+                batch.totalBlocks += result.totalBlocks;
+            }
+        }
+        if (batch.totalBlocks == 0) return batch;
+        int index = 0;
+        for (int row = 0; row < rows; row++) {
+            for (int column = 0; column < columns; column++) {
+                Result result = results.get(index++);
+                String tileName = baseName + String.format(java.util.Locale.ROOT, "_r%03d_c%03d", row, column);
+                paths.add(writeSchematic(tileName, result));
+            }
+        }
+        return batch;
+    }
+
+    private static Result generateTile(int[] pixels, int imgWidth, int imgHeight, int tileX, int tileY, int tileSize,
+                                       int scaledWidth, int scaledHeight, int offsetX, int offsetY) {
+        Result result = new Result(tileSize);
+        for (int z = 0; z < tileSize; z++) {
+            int canvasY = tileY + z;
+            for (int x = 0; x < tileSize; x++) {
+                int canvasX = tileX + x;
+                if (canvasX < offsetX || canvasX >= offsetX + scaledWidth
+                        || canvasY < offsetY || canvasY >= offsetY + scaledHeight) continue;
+                int sx = Math.min(imgWidth - 1, (int) ((long) (canvasX - offsetX) * imgWidth / scaledWidth));
+                int sy = Math.min(imgHeight - 1, (int) ((long) (canvasY - offsetY) * imgHeight / scaledHeight));
+                int pixel = pixels[sy * imgWidth + sx];
+                if ((pixel >>> 24) < ALPHA_THRESHOLD) continue;
+                int index = CarpetPalette.nearestIndex(pixel);
+                result.states[z * tileSize + x] = CarpetPalette.state(index);
+                result.counts[index]++;
+                result.totalBlocks++;
+            }
+        }
+        return result;
     }
 
     /**
@@ -99,6 +178,20 @@ public final class PixelArtGenerator {
             throw new IllegalStateException("litematica 写入失败: " + dir.resolve(baseName + ".litematic"));
         }
         return dir.resolve(baseName + ".litematic");
+    }
+
+    /** 数量统计发聊天: 多分片合计。 */
+    public static void sendStatsToChat(BatchResult batch) {
+        StringBuilder builder = new StringBuilder("所需地毯(全部投影): ");
+        for (int i = 0; i < CarpetPalette.SIZE; i++) {
+            int count = batch.counts[i];
+            if (count == 0) continue;
+            if (builder.length() > 0 && builder.charAt(builder.length() - 1) != ' ') builder.append(' ');
+            String piece = com.autocarpet.util.Names.get(CarpetPalette.block(i).asItem()) + "x" + count;
+            builder.append(count > 64 ? "§c" + piece + "§7" : piece);
+        }
+        builder.append(" §8(共").append(batch.totalBlocks).append(", ").append(batch.count()).append("张)");
+        Chat.info("%s", builder);
     }
 
     /** 数量统计发聊天: 每色一行内的紧凑列表, 超过一组 (>64) 的标红 */

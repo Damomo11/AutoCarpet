@@ -159,6 +159,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     public final Setting.Bool turning;
     public final Setting.Bool randomView;
     public final Setting.Int toggleKey;
+    public final Setting.Int configKey;
     // 打印机设置 (Lotus af)
     public final Setting.Int printerRange;
     public final Setting.Int printerCount;
@@ -259,7 +260,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     public CartographerModule() {
         super("制图师", "自动打印地图画(仅地毯), 需要搭配制图平台使用, 投影原点必须是左上角");
         // ---- 设置 (Lotus s_0 + aj + u_0 + af) ----
-        this.printRange = this.intSetting("打印范围", "每次打印的行宽(格), 1-3", 2, 1, 3);
+        this.printRange = this.intSetting("打印范围", "每次打印的行宽(格), 1-64", 2, 1, 64);
         this.extraSupply = this.intSetting("额外补货量", "补货时, 至少多补的数量", 32, 0, 64);
         this.pauseTicks = this.intSetting("暂停时间(tick)", "画完一张后的暂停时间", 200, 0, 2000);
         this.schematicDir = this.str("投影路径(相对)", "内部兼容设置；队列固定使用 schematics/momomap", "momomap");
@@ -270,11 +271,12 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         this.namingDelay = this.intSetting("命名延迟(tick)", "命名地图后的等待时间", 200, 0, 2000);
         this.actionDelay = this.intSetting("延迟", "操作之间的间隔延迟(tick)", 5, 0, 40);
         this.restartDelay = this.intSetting("重启延时(秒)", "出错重启的延时(秒)", 2, 1, 200);
-        this.turning = this.bool("转向", "打印和寻路时调整视角", true);
+        this.turning = this.bool("转向", "打印和寻路时调整视角", false);
         this.randomView = this.bool("随机视角", "启用随机视角抖动", false);
         this.toggleKey = this.intSetting("快捷键", "切换制图师的 GLFW 按键代码", GLFW.GLFW_KEY_RIGHT_CONTROL, 0, 512);
-        this.printerRange = this.intSetting("打印·放置范围(格)", "打印机搜索放置位置的范围", 4, 1, 6);
-        this.printerCount = this.intSetting("打印·数量(每tick)", "打印机每tick放置的数量", 1, 1, 16);
+        this.configKey = this.intSetting("配置页快捷键", "打开配置界面的按键, 无表示未绑定", 0, 0, 512);
+        this.printerRange = this.intSetting("打印·放置范围(格)", "打印机搜索放置位置的范围", 4, 1, 128);
+        this.printerCount = this.intSetting("打印·数量(每tick)", "打印机每tick放置的数量", 5, 1, 16);
         this.placeTimeout = this.intSetting("打印·放置超时", "同一位置失败后冷却 tick", 20, 0, 100);
         this.faceCheckLimit = this.intSetting("打印·面校验上限", "每tick进行射线面校验的最大次数", 16, 1, 64);
         this.printerNearest = this.bool("打印·优先近处", "开启后优先打印离玩家近的方块", true);

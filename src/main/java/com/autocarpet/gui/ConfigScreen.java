@@ -20,8 +20,8 @@ public class ConfigScreen extends Screen {
     private Module module;
     private Button moduleToggle;
     private double scroll;
-    private boolean capturingKey;
-    private Button keyButton;
+    /** 正在等待按键输入的设置名, null 表示无 */
+    private String capturingSetting;
     private int contentTop;
     private int contentBottom;
 
@@ -68,12 +68,13 @@ public class ConfigScreen extends Screen {
                 }).bounds(this.width / 2 - 150, y, 300, 20).build();
                 addSetting(button, y);
             } else if (setting instanceof Setting.Int integer) {
-                if ("快捷键".equals(setting.name)) {
-                    this.keyButton = Button.builder(Component.literal(capturingKey ? "按下按键…" : "快捷键  " + integer.get()), b -> {
-                        this.capturingKey = true;
+                if (setting.name.endsWith("快捷键")) {
+                    boolean capturing = setting.name.equals(this.capturingSetting);
+                    Button keyBtn = Button.builder(Component.literal(capturing ? "按下按键…" : setting.name + "  " + keyLabel(integer.get())), b -> {
+                        this.capturingSetting = setting.name;
                         b.setMessage(Component.literal("按下按键…"));
                     }).bounds(this.width / 2 - 150, y, 300, 20).build();
-                    addSetting(this.keyButton, y);
+                    addSetting(keyBtn, y);
                     y += 24;
                     continue;
                 }
@@ -114,24 +115,30 @@ public class ConfigScreen extends Screen {
     }
 
     private int intStep(Setting.Int setting) {
-        return (setting.max - setting.min) > 100 ? 10 : 1;
+        return 1;
+    }
+
+    /** 按键值显示: 0 为无, 可打印键用 GLFW 键名, 其余用 MC 键名 (key.keyboard.xxx 的后缀) */
+    private static String keyLabel(int code) {
+        if (code == 0) return "无";
+        String name = org.lwjgl.glfw.GLFW.glfwGetKeyName(code, 0);
+        if (name != null && !name.isEmpty()) return name.toUpperCase(java.util.Locale.ROOT);
+        String full = com.mojang.blaze3d.platform.InputConstants.Type.KEYSYM.getOrCreate(code).getName();
+        if (full.startsWith("key.keyboard.")) full = full.substring("key.keyboard.".length());
+        return full.toUpperCase(java.util.Locale.ROOT);
     }
 
     @Override
     public boolean keyPressed(KeyEvent event) {
-        if (this.capturingKey && this.module != null) {
-            if (event.key() == 256) {
-                this.capturingKey = false;
-                refreshSettingWidgets();
-                return true;
-            }
-            Setting<?> setting = moduleSetting("快捷键");
+        if (this.capturingSetting != null && this.module != null) {
+            Setting<?> setting = moduleSetting(this.capturingSetting);
+            this.capturingSetting = null;
             if (setting instanceof Setting.Int key) {
-                key.set(Math.max(0, Math.min(512, event.key())));
-                this.capturingKey = false;
-                refreshSettingWidgets();
-                return true;
+                // ESC (256) 清除绑定 (设为无), 其余按键记录键值
+                key.set(event.key() == 256 ? 0 : Math.max(1, Math.min(512, event.key())));
             }
+            refreshSettingWidgets();
+            return true;
         }
         return super.keyPressed(event);
     }
