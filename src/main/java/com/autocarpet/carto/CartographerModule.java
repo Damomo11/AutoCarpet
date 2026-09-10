@@ -49,8 +49,8 @@ import net.minecraft.world.level.block.AnvilBlock;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.level.saveddata.maps.MapItemSavedData;
 import net.minecraft.world.level.entity.EntityTypeTest;
+
 import net.minecraft.world.item.MapItem;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
@@ -102,6 +102,12 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     private static final int MAP_SIZE = 128;
     /** 移动保护距离 */
     private static final int MAX_PATH_DISTANCE = 1000;
+    /** 开箱重试基础间隔 (服务器卡顿时过快开箱会失败, 失败后倍增) */
+    private static final long OPEN_BASE_BACKOFF_MS = 1000;
+    /** 开箱重试上限: 基础间隔倍增 2 次后达到, 之后一直按此间隔重试 */
+    private static final long OPEN_MAX_BACKOFF_MS = 4000;
+    /** 开箱后等待容器内容同步的基础时间 (tick), 失败倍增, 上限为 4 倍 */
+    private static final int DWELL_BASE_TICKS = 10;
 
     // ------------------------------------------------------------------
     // 状态机 (Lotus ag_0, 只保留制图师用到的状态)
@@ -133,8 +139,6 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         SORT,
         /** 铁砧命名成品地图 (原版 USE/au_0.I) */
         NAME,
-        /** 等待输出箱确认成品地图已接收 (独立版增强, 用于归档时机) */
-        OUTPUT_CONFIRM,
         /** 加载下一张投影 */
         LOAD_SCHEMATIC,
         /** 检查背包缺哪些地毯 */
@@ -237,10 +241,23 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     private long stableSize = -1L;
     private long stableModified = Long.MIN_VALUE;
     private int stableTicks;
-    private int outputConfirmTicks;
-    private int outputWaitTicks;
-    private boolean outputShiftSent;
-    private int outputInventoryFilledCount;
+    private int outputFailCount;
+    /** 本轮成品地图是否已完成锁定 (客户端地图数据不可靠, 锁定状态由状态机自己跟踪) */
+    private boolean mapLocked;
+    /** 模块自增 tick 计数 */
+    private long tickCounter;
+    /** 当前容器菜单打开时的 tick, -1 表示未跟踪 */
+    private long menuOpenTick = -1L;
+    /** 开箱后等待内容同步的时间 (tick): 首次正常, 失败倍增, 上限 4 倍 */
+    private int containerDwellTicks;
+    /** 容器连续扫描不到目标物品的次数 */
+    private int emptyScanFails;
+    /** 上一次尝试放入时的背包成品地图数, 用于判断点击是否生效 */
+    private int lastPutCount = -1;
+    /** 放入重试间隔 (tick): 首次正常, 失败倍增, 倍增 2 次后达到上限 */
+    private int putRetryTicks;
+    /** 开箱重试间隔 (ms): 基础 1s, 失败倍增, 上限 4s */
+    private long openBackoffMs = OPEN_BASE_BACKOFF_MS;
     private boolean previousAntiCheat;
     private double previousRandomLooking;
     private double previousRandomLooking113;
@@ -301,7 +318,6 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         this.register(State.PUT, this::onPut);
         this.register(State.SORT, this::onSort);
         this.register(State.NAME, this::onName);
-        this.register(State.OUTPUT_CONFIRM, this::confirmOutput);
         // ---- baritone 事件 (Lotus an 构造器) ----
         baritone.getGameEventHandler().registerEventListener(this);
     }
@@ -381,6 +397,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
 
     @Override
     public void onTick() {
+        this.tickCounter++;
         if (this.scanCooldown > 0) this.scanCooldown--;
         this.scanQueue();
         // Keep Baritone's globals aligned while active, including changes made in the screen.
@@ -472,6 +489,13 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     /** 设置自定义延迟 (Lotus u_0.d) */
     private void d(int ticks) {
         this.delayTicks = ticks;
+    }
+
+    /** 重试间隔: 首次为 base, 每次失败倍增, 倍增 2 次后达到 base*4 上限并保持 */
+    private int doubledDelay(int current, int base) {
+        int b = Math.max(1, base);
+        if (current <= 0) return b;
+        return Math.min(current * 2, b * 4);
     }
 
     /** 剩余延迟 (Lotus u_0.l) */
@@ -579,10 +603,21 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         if (menu instanceof InventoryMenu || !pos.equals(this.lastOpenPos)) {
             this.attemptOpen(pos, side);
         } else if (menu instanceof ChestMenu || menu instanceof ShulkerBoxMenu) {
-            this.openSent = false;
+            if (this.openSent) {
+                // 箱子刚打开: 记录打开时刻, 先等内容同步再操作 (开箱->关箱太快会点在空容器上)
+                this.openSent = false;
+                this.openBackoffMs = OPEN_BASE_BACKOFF_MS;
+                this.menuOpenTick = this.tickCounter;
+            }
+            if (this.menuOpenTick < 0) this.menuOpenTick = this.tickCounter;
+            if (this.tickCounter - this.menuOpenTick < this.containerDwellTicks) {
+                this.k();   // 服务器卡顿时等内容刷出来再点击
+                return;
+            }
             consumer.accept(menu);
         } else {
             this.openSent = false;
+            this.openBackoffMs = OPEN_BASE_BACKOFF_MS;
             InvUtils.closeContainer();
             Chat.warning("打开的容器错误");
             this.k();
@@ -591,7 +626,11 @@ public class CartographerModule extends Module implements AbstractGameEventListe
 
     private void attemptOpen(BlockPos pos, Direction side) {
         long now = System.currentTimeMillis();
-        if (!this.openSent || now - this.lastOpenTime > 1000) {
+        if (!this.openSent || now - this.lastOpenTime > this.openBackoffMs) {
+            if (this.openSent) {
+                // 上一次 use 包后箱子没打开 (服务器卡顿), 重试间隔倍增: 1s -> 2s -> 4s (上限)
+                this.openBackoffMs = Math.min(this.openBackoffMs * 2, OPEN_MAX_BACKOFF_MS);
+            }
             if (side == null) {
                 PlaceUtils.openAuto(pos);
             } else {
@@ -600,8 +639,6 @@ public class CartographerModule extends Module implements AbstractGameEventListe
             this.openSent = true;
             this.lastOpenTime = now;
             this.lastOpenPos = new BlockPos(pos);
-        } else {
-            Chat.warning("打开没有反应...");
         }
         this.k();
     }
@@ -679,6 +716,19 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     /** 玩家距离方块中心 (Lotus aj.a(BlockPos,double)) */
     private boolean fartherThan(BlockPos pos, double dist) {
         return mc.player.position().distanceTo(pos.getCenter()) > dist;
+    }
+
+    /**
+     * 玩家是否已贴近容器: 8 邻格或上下 1 格内即视为可直接交互。
+     * 原先按欧氏距离 <= 1.0 判定, 但玩家站在箱子侧邻 (约 1.12) 或斜邻 (约 2.06)
+     * 时永远不满足, 而寻路目标 GoalNear(range 0) 在上方方块不可站立时只能停在邻格,
+     * 导致无限"前往放入成品"循环、箱子始终打不开 (偶现)。
+     */
+    private boolean nearContainer(BlockPos pos) {
+        int dx = Math.abs(mc.player.getBlockX() - pos.getX());
+        int dy = Math.abs(mc.player.getBlockY() - pos.getY());
+        int dz = Math.abs(mc.player.getBlockZ() - pos.getZ());
+        return dx <= 1 && dy <= 1 && dz <= 1;
     }
 
     /** 眼睛距离方块中心 (Lotus aj.b(BlockPos,double)) */
@@ -957,9 +1007,9 @@ public class CartographerModule extends Module implements AbstractGameEventListe
             return;
         }
         BlockPos stand = this.raiseToPlayerY(this.supplyChest);
-        if (this.fartherThan(stand, 1.0)) {   // 原版 G: 脚部距离 a(pos, 1.0), pathTo range 0
+        if (!this.nearContainer(stand)) {
             Chat.info("前往补给");
-            this.pathTo(stand, 0, State.SUPPLY);
+            this.pathTo(stand, 1, State.SUPPLY);
             return;
         }
         boolean needMap = !hasMap;
@@ -974,10 +1024,20 @@ public class CartographerModule extends Module implements AbstractGameEventListe
                         || needXP && it == Items.EXPERIENCE_BOTTLE;
             });
             if (stack.isEmpty()) {
-                Chat.warning("无法补给, 稍后重启");
-                this.restart(State.SUPPLY);
+                // 服务器卡顿时箱子内容可能还没同步: 倍增等待时间后重扫, 连续多次为空才重启
+                this.containerDwellTicks = doubledDelay(this.containerDwellTicks, DWELL_BASE_TICKS);
+                this.menuOpenTick = this.tickCounter;
+                this.emptyScanFails++;
+                if (this.emptyScanFails >= 3) {
+                    Chat.warning("无法补给, 稍后重启");
+                    this.restart(State.SUPPLY);
+                    return;
+                }
+                this.k();
                 return;
             }
+            this.emptyScanFails = 0;
+            this.containerDwellTicks = 0;
             int empty = this.firstEmptyInvSlot();
             if (empty != -1) {
                 Chat.info("补给: %s", Names.get(stack));
@@ -1032,6 +1092,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
             return;
         }
         Chat.warning("绘制地图, 并等待加载...");
+        this.mapLocked = false;
         mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
         this.d(this.pauseTicks.get());
     }
@@ -1044,11 +1105,11 @@ public class CartographerModule extends Module implements AbstractGameEventListe
             return;
         }
         BlockPos stand = this.raiseToPlayerY(this.cartographyTable);
-        if (this.fartherThan(stand, 1.0)) {   // 原版 D: 脚部距离 a(pos, 1.0), pathTo range 0
+        if (!this.nearContainer(stand)) {
             Chat.info("前往制图台");
-            this.pathTo(stand, 0, State.LOCK);
+            this.pathTo(stand, 1, State.LOCK);
             return;
-            }
+        }
         if (mc.player.containerMenu instanceof InventoryMenu) {
             if (stand != this.cartographyTable) {
                 PlaceUtils.openFacing(this.cartographyTable, Direction.UP);
@@ -1065,8 +1126,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
                     this.delayedTransition(State.SUPPLY);
                     return;
                 }
-                MapItemSavedData data = MapItem.getSavedData(filled, mc.level);
-                if (data != null && data.locked) {
+                if (this.mapLocked) {
                     Chat.info("已锁定, 不需要锁定");
                     this.delayedTransition(State.NAME);
                     return;
@@ -1084,6 +1144,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
             } else if (!menu.getSlot(2).getItem().isEmpty()) {
                 Chat.info("锁定地图");
                 InvUtils.shiftClick(2);
+                this.mapLocked = true;
                 this.delayedTransition(this.autoName.get() ? State.NAME : State.PUT);
             }
             this.k();
@@ -1097,34 +1158,55 @@ public class CartographerModule extends Module implements AbstractGameEventListe
             this.finishPainting();
             return;
         }
-        MapItemSavedData data = MapItem.getSavedData(filled, mc.level);
-        if (data != null && !data.locked) {
+        // 不能用客户端 MapItemSavedData 判断锁定: 地图锁定后不再被手持, 客户端副本的 locked
+        // 长期停留在 false, 会把成品反复弹回 LOCK 循环, 永远走不到入箱 (偶发未入箱的根因)。
+        // 锁定与否由状态机 mapLocked 跟踪。
+        if (!this.mapLocked) {
+            Chat.info("成品地图未锁定, 重新锁定");
             this.state = State.LOCK;
             return;
         }
         if (this.autoName.get()) {
             Component customName = filled.getCustomName();
-            if (customName == null || !this.mapName.equals(customName.getString())) {
+            if (customName == null || !displayName().equals(customName.getString())) {
+                Chat.info("成品地图名称不符 (当前: %s, 期望: %s), 前往命名",
+                        customName == null ? "无" : customName.getString(), displayName());
                 this.state = State.NAME;
                 return;
             }
         }
         BlockPos stand = this.raiseToPlayerY(this.outputChest);
-        if (this.fartherThan(stand, 1.0)) {   // 原版 C: 脚部距离 a(pos, 1.0), pathTo range 0
+        if (!this.nearContainer(stand)) {
             Chat.info("前往放入成品");
-            this.pathTo(stand, 0, State.PUT);
+            this.pathTo(stand, 1, State.PUT);
             return;
+        }
+        // 简单重试: 背包里还有成品地图就再放一次;
+        // 点击后背包数量没变说明服务器没处理到 (卡顿/箱子未同步), 按倍增间隔重试
+        int count = countFilledMapsInInventory();
+        if (this.lastPutCount >= 0 && count == this.lastPutCount && count > 0) {
+            this.putRetryTicks = doubledDelay(this.putRetryTicks, Math.max(1, this.actionDelay.get()));
+            this.containerDwellTicks = doubledDelay(this.containerDwellTicks, DWELL_BASE_TICKS);
+            this.outputFailCount++;
+            if (this.outputFailCount % 3 == 0) {
+                String reason = this.outputChestFull() ? "输出箱已满" : "服务器未处理放入";
+                Chat.warning("成品地图放入未生效 (%s), 已重试 %s 次", reason, this.outputFailCount);
             }
+            if (this.outputFailCount >= 12) {
+                Chat.error("成品地图多次放入失败, 制图师已停止");
+                this.toggle();
+                return;
+            }
+        } else {
+            this.outputFailCount = 0;
+            this.putRetryTicks = 0;
+            this.containerDwellTicks = 0;
+        }
+        this.lastPutCount = count;
         this.openContainer(this.outputChest, menu -> {
-            if (this.outputShiftSent) return;
             Chat.info("放入成品地图");
-            this.outputInventoryFilledCount = countFilledMapsInInventory();
             InvUtils.shiftClickInv(this.invScanSlot());
-            this.outputShiftSent = true;
-            this.outputConfirmTicks = 2;
-            this.outputWaitTicks = 0;
-            this.state = State.OUTPUT_CONFIRM;
-            this.k();
+            this.d(this.putRetryTicks > 0 ? this.putRetryTicks : this.actionDelay.get());
         });
     }
 
@@ -1156,7 +1238,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
                 return;
             }
         }
-        this.outputShiftSent = false;
+        this.containerDwellTicks = 0;
         this.scanCooldown = 0;
         this.state = State.LOAD_SCHEMATIC;  // 原版 M(): 加载下一张
         Chat.info("暂停一会, 等待水收回...");
@@ -1169,29 +1251,13 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         return count;
     }
 
-    private boolean outputHasFilledMap() {
+    /** 当前打开的输出箱是否已满 (所有容器自身槽位都有物品) */
+    private boolean outputChestFull() {
         AbstractContainerMenu menu = mc.player.containerMenu;
         if (menu instanceof InventoryMenu) return false;
         int count = Math.max(0, menu.slots.size() - MAIN_INVENTORY_SIZE);
-        for (int i = 0; i < count; i++) if (menu.getSlot(i).getItem().getItem() == Items.FILLED_MAP) return true;
-        return false;
-    }
-
-    /** 确认成品地图已进入输出箱 (防丢) 后回到 PUT 继续放剩余的成品 */
-    private void confirmOutput() {
-        if (this.outputConfirmTicks > 0) {
-            this.outputConfirmTicks--;
-            return;
-        }
-        boolean received = countFilledMapsInInventory() < this.outputInventoryFilledCount && outputHasFilledMap();
-        if (!received && this.outputWaitTicks < 60) {
-            this.outputWaitTicks++;
-            return;
-        }
-        this.outputWaitTicks = 0;
-        this.outputShiftSent = false;
-        this.state = State.PUT;
-        this.k();
+        for (int i = 0; i < count; i++) if (menu.getSlot(i).getItem().isEmpty()) return false;
+        return true;
     }
 
     /** SORT (原版 O): 独立版没有快捷物品操作模块, 跳过排序后回 TAKE_ITEM (原版 c(au_0.t)) */
@@ -1220,7 +1286,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
                 InvUtils.shiftClickInv(this.invScanSlot());
             } else {
                 ItemStack result = anvilMenu.getSlot(2).getItem();
-                String name = this.mapName == null ? "" : this.mapName;
+                String name = displayName();
                 Component customName = result.getCustomName();
                 if (customName == null || !name.equals(customName.getString())) {
                     Chat.info("命名地图: %s", name);
@@ -1258,11 +1324,11 @@ public class CartographerModule extends Module implements AbstractGameEventListe
             return;
         }
         BlockPos stand = this.raiseToPlayerY(this.anvilPos);
-        if (this.fartherThan(stand, 1.0)) {   // 原版 E: 脚部距离 a(pos, 1.0), pathTo range 0
+        if (!this.nearContainer(stand)) {
             Chat.info("前往铁砧");
-            this.pathTo(stand, 0, State.NAME);
+            this.pathTo(stand, 1, State.NAME);
             return;
-            }
+        }
         if (!this.anvilPlaced()) {
             FindItemResult anvil = InvUtils.find(Items.ANVIL);
             if (!anvil.found()) {
@@ -1291,7 +1357,13 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     private boolean isMapToName(ItemStack stack) {
         if (stack.getItem() != Items.FILLED_MAP) return false;
         Component customName = stack.getCustomName();
-        return customName == null || !this.mapName.equals(customName.getString());
+        return customName == null || !displayName().equals(customName.getString());
+    }
+
+    /** 地图命名用名称: 铁砧上限 50 字符, 超长投影文件名截断, 否则命名永远不匹配导致无限改名循环 */
+    private String displayName() {
+        String name = this.mapName == null ? "" : this.mapName;
+        return name.length() > 50 ? name.substring(0, 50) : name;
     }
 
     /** 铁砧位置是否放着铁砧 (原版 instanceof AnvilBlock 判定, 含残损铁砧) */
@@ -1395,10 +1467,20 @@ public class CartographerModule extends Module implements AbstractGameEventListe
             }
             ItemStack stack = this.scanContainer(item -> item.getItem() == this.supplyItem);
             if (stack.isEmpty()) {
-                Chat.warning("无法补货: %s, 稍后重启", Names.get(this.supplyItem));
-                this.restart(State.CHECK_BACKPACK);
+                // 同 SUPPLY: 内容未同步时倍增等待后重扫, 连续多次为空才重启
+                this.containerDwellTicks = doubledDelay(this.containerDwellTicks, DWELL_BASE_TICKS);
+                this.menuOpenTick = this.tickCounter;
+                this.emptyScanFails++;
+                if (this.emptyScanFails >= 3) {
+                    Chat.warning("无法补货: %s, 稍后重启", Names.get(this.supplyItem));
+                    this.restart(State.CHECK_BACKPACK);
+                    return;
+                }
+                this.k();
                 return;
             }
+            this.emptyScanFails = 0;
+            this.containerDwellTicks = 0;
             int taken = stack.getCount();
             InvUtils.shiftClick(this.containerScanSlot());
             if (this.supplyAmount <= taken) {
@@ -1813,9 +1895,14 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         this.supplyTarget = null;
         this.breakTarget = null;
         this.anchor = null;
-        this.outputConfirmTicks = 0;
-        this.outputWaitTicks = 0;
-        this.outputShiftSent = false;
+        this.outputFailCount = 0;
+        this.mapLocked = false;
+        this.lastPutCount = -1;
+        this.putRetryTicks = 0;
+        this.openBackoffMs = OPEN_BASE_BACKOFF_MS;
+        this.menuOpenTick = -1L;
+        this.containerDwellTicks = 0;
+        this.emptyScanFails = 0;
         this.supplyReturn = State.DRAW;
         this.pendingState = null;
         this.delayedState = State.NONE;
