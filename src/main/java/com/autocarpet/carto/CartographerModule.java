@@ -135,7 +135,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         LOCK,
         /** 放入成品地图 */
         PUT,
-        /** 背包整理 (独立版跳过, 原版 O 完成后回 TAKE_ITEM) */
+        /** 背包整理 (合并同物品未满叠腾出空槽, 完成后回 TAKE_ITEM) */
         SORT,
         /** 铁砧命名成品地图 (原版 USE/au_0.I) */
         NAME,
@@ -256,6 +256,8 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     private int lastPutCount = -1;
     /** 放入重试间隔 (tick): 首次正常, 失败倍增, 倍增 2 次后达到上限 */
     private int putRetryTicks;
+    /** 输出箱已满的连续等待轮数 (控制等待日志频率) */
+    private int putFullWaits;
     /** 开箱重试间隔 (ms): 基础 1s, 失败倍增, 上限 4s */
     private long openBackoffMs = OPEN_BASE_BACKOFF_MS;
     private boolean previousAntiCheat;
@@ -450,8 +452,9 @@ public class CartographerModule extends Module implements AbstractGameEventListe
                 handler.run();
             } catch (Throwable throwable) {
                 throwable.printStackTrace();
-                Chat.error("发生未知异常 : %s", throwable.getMessage());
-                this.toggle();
+                // 挂机模式: 偶发异常 (卡顿/瞬时的空指针等) 不停机, 节流后从原状态恢复
+                Chat.error("发生未知异常 : %s, 稍后从 [%s] 状态恢复", throwable.getMessage(), this.state);
+                this.restart(this.state);
                 return;
             }
         }
@@ -536,10 +539,14 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     // ---- 重启调度 (Lotus aj.d/A/B) ----
 
     private void delayedRestart(State target) {
+        this.delayedRestart(target, this.restartDelay.get());
+    }
+
+    private void delayedRestart(State target, int seconds) {
         this.cancelRestart();
         GameType mode = mc.gameMode.getPlayerMode();
         if (mode == GameType.SPECTATOR || mode == GameType.ADVENTURE) return;
-        this.restartTimer = this.restartDelay.get() * 20;
+        this.restartTimer = seconds * 20;
         this.restartTarget = target;
     }
 
@@ -550,10 +557,14 @@ public class CartographerModule extends Module implements AbstractGameEventListe
 
     /** 关闭容器 + 延迟重启 (Lotus s_0.e) */
     private void restart(State target) {
+        this.restart(target, this.restartDelay.get());
+    }
+
+    /** 关闭容器 + 按指定秒数延迟重启 (输出箱已满等需要长冷却的场景) */
+    private void restart(State target, int seconds) {
         InvUtils.closeContainer();
         this.state = State.NONE;
-        this.cancelRestart();
-        this.delayedRestart(target);
+        this.delayedRestart(target, seconds);
     }
 
     // ---- 延迟跳转 (Lotus aj.a/b/c/y) ----
@@ -1192,15 +1203,31 @@ public class CartographerModule extends Module implements AbstractGameEventListe
                 String reason = this.outputChestFull() ? "输出箱已满" : "服务器未处理放入";
                 Chat.warning("成品地图放入未生效 (%s), 已重试 %s 次", reason, this.outputFailCount);
             }
+            // 挂机模式: 绝不因放入失败停止。连续失败到阈值后关箱重开一轮 (修复 desync/卡顿);
+            // 输出箱已满则长冷却等待 (常见输出箱下接漏斗会自行清空, 或等人工清箱)
             if (this.outputFailCount >= 12) {
-                Chat.error("成品地图多次放入失败, 制图师已停止");
-                this.toggle();
+                boolean full = this.outputChestFull();
+                this.outputFailCount = 0;
+                this.putRetryTicks = 0;
+                this.containerDwellTicks = 0;
+                this.lastPutCount = -1;
+                if (full) {
+                    this.putFullWaits++;
+                    if (this.putFullWaits % 3 == 1) {
+                        Chat.warning("输出箱已满, 每 10 秒重试直到清空");
+                    }
+                    this.restart(State.PUT, 10);
+                } else {
+                    Chat.warning("放入持续未生效, 关闭界面重新开箱");
+                    this.restart(State.PUT);
+                }
                 return;
             }
         } else {
             this.outputFailCount = 0;
             this.putRetryTicks = 0;
             this.containerDwellTicks = 0;
+            this.putFullWaits = 0;
         }
         this.lastPutCount = count;
         this.openContainer(this.outputChest, menu -> {
@@ -1260,14 +1287,104 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         return true;
     }
 
-    /** SORT (原版 O): 独立版没有快捷物品操作模块, 跳过排序后回 TAKE_ITEM (原版 c(au_0.t)) */
+    /**
+     * SORT (原版 O): 原版由快捷物品操作模块整理背包, 独立版改为合并同物品的未满叠。
+     * 每次点击合并一组腾出空槽, 合并到底后回 TAKE_ITEM (原版 c(au_0.t));
+     * 仍然全满则丢数量最少且可再补给的物品 (地毯/空地图/玻璃板等补给箱都有, 打印消耗也会腾空间),
+     * 只剩成品地图时转 PUT 入库 —— 挂机模式任何情况都不停机。
+     */
     private void onSort() {
-        Chat.warning("独立版没有快捷物品操作模块, 跳过排序");
         if (mc.screen != null) {
             mc.setScreen(null);
         }
-        this.state = State.TAKE_ITEM;
+        if (this.mergePartialStacks()) {
+            this.k();
+            return;
+        }
+        if (!this.inventoryFull()) {
+            Chat.info("背包整理完成, 继续补货");
+            this.state = State.TAKE_ITEM;
+            this.k();
+            return;
+        }
+        int smallest = this.smallestCarpetSlot();
+        if (smallest < 0) smallest = this.smallestDroppableSlot();
+        if (smallest >= 0) {
+            Chat.warning("整理后背包仍满, 丢弃数量最少的物品腾出空位: %s",
+                    Names.get(mc.player.getInventory().getItem(smallest).getItem()));
+            InvUtils.dropSlot(smallest);
+            this.state = State.TAKE_ITEM;
+            this.k();
+            return;
+        }
+        Chat.warning("背包被成品地图占满, 转去放入输出箱");
+        this.state = State.PUT;
         this.k();
+    }
+
+    /**
+     * 合并一对同物品未满叠 (每 tick 最多一组, 防连点触发反作弊)。
+     * swapSlots 三段点击天然支持装不下时把剩余放回原槽; 每组合并必然填满一叠或清空一槽,
+     * 所以最多 36 组就会终止。返回 false 表示没有可合并的。
+     */
+    private boolean mergePartialStacks() {
+        if (!(mc.player.containerMenu instanceof InventoryMenu)) return false;
+        Inventory inventory = mc.player.getInventory();
+        for (int i = 0; i < MAIN_INVENTORY_SIZE; i++) {
+            ItemStack from = inventory.getItem(i);
+            if (from.isEmpty() || from.getCount() >= from.getMaxStackSize()) continue;
+            for (int j = 0; j < MAIN_INVENTORY_SIZE; j++) {
+                if (i == j) continue;
+                ItemStack to = inventory.getItem(j);
+                if (to.isEmpty() || to.getCount() >= to.getMaxStackSize()) continue;
+                if (!ItemStack.isSameItemSameComponents(from, to)) continue;
+                InvUtils.swapSlots(InvUtils.indexToId(i), InvUtils.indexToId(j));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 数量最少的地毯槽位 (丢弃损失最小且可从补给箱取回), 没有地毯则 -1 */
+    private int smallestCarpetSlot() {
+        Inventory inventory = mc.player.getInventory();
+        int bestSlot = -1;
+        int bestCount = Integer.MAX_VALUE;
+        for (int i = 0; i < MAIN_INVENTORY_SIZE; i++) {
+            ItemStack stack = inventory.getItem(i);
+            if (!CartoItems.isCarpet(stack.getItem())) continue;
+            if (stack.getCount() < bestCount) {
+                bestSlot = i;
+                bestCount = stack.getCount();
+            }
+        }
+        return bestSlot;
+    }
+
+    /** 数量最少且可安全丢弃的槽位 (成品地图是产出绝不能丢, 其余物资都能从补给箱再取), 没有则 -1 */
+    private int smallestDroppableSlot() {
+        Inventory inventory = mc.player.getInventory();
+        int bestSlot = -1;
+        int bestCount = Integer.MAX_VALUE;
+        for (int i = 0; i < MAIN_INVENTORY_SIZE; i++) {
+            ItemStack stack = inventory.getItem(i);
+            if (stack.getItem() == Items.FILLED_MAP) continue;
+            if (stack.getCount() < bestCount) {
+                bestSlot = i;
+                bestCount = stack.getCount();
+            }
+        }
+        return bestSlot;
+    }
+
+    /** 背包中指定物品的未满叠槽位 (shift 点击可并入), 没有则 -1 */
+    private int findPartialInvSlot(Item item) {
+        Inventory inventory = mc.player.getInventory();
+        for (int i = 0; i < MAIN_INVENTORY_SIZE; i++) {
+            ItemStack stack = inventory.getItem(i);
+            if (stack.getItem() == item && stack.getCount() < stack.getMaxStackSize()) return i;
+        }
+        return -1;
     }
 
     /** NAME (原版 USE/au_0.I, handler E): 铁砧命名成品地图, 命名用投影文件名 */
@@ -1451,7 +1568,8 @@ public class CartographerModule extends Module implements AbstractGameEventListe
             return;
         }
         this.openContainer(this.supplyTarget, menu -> {
-            if (this.inventoryFull()) {
+            // 满的是槽位不一定是容量: 待补地毯在背包已有未满叠时, shift 点击会并入该叠, 不需要空槽
+            if (this.inventoryFull() && this.findPartialInvSlot(this.supplyItem) < 0) {
                 Chat.info("背包满了, 尝试清理");
                 Map<Item, Integer> have = countCarpetsInInventory();
                 Item excess = findExcessItem(have);
@@ -1899,6 +2017,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         this.mapLocked = false;
         this.lastPutCount = -1;
         this.putRetryTicks = 0;
+        this.putFullWaits = 0;
         this.openBackoffMs = OPEN_BASE_BACKOFF_MS;
         this.menuOpenTick = -1L;
         this.containerDwellTicks = 0;
