@@ -435,7 +435,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         // 非寻路状态不得残留任何真实视角目标 (放置/破坏一律走 PlaceUtils 静默旋转)
         if (this.state != State.WALKING) Rotations.clearTarget();
         // 任何界面打开时: 松开对齐移动键, 打印机停手 (状态机照常跑, 开容器/命名必须点界面)
-        if (mc.screen != null) {
+        if (mc.gui.screen() != null) {
             this.releaseAlignmentKeys();
         }
         // 寻路兜底 (独立版保底出口): 正常到达/取消由 onPathEvent(CANCELED) 恢复;
@@ -480,7 +480,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         }
         // 打印机独立于状态机运行 (Lotus aj.onTickPost), 且在状态机之后 (原版 TickEvent.Pre -> Post 顺序),
         // 状态机被延迟跳过时打印机照常运行; 界面打开时停手 (26.3 服务器上界面交互期间放方块会与移动包冲突)
-        if (mc.screen == null) this.printer.tick();
+        if (mc.gui.screen() == null) this.printer.tick();
     }
 
     @Override
@@ -529,7 +529,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     // ---- baritone 寻路 (Lotus an) ----
 
     private void pathTo(BlockPos pos, int range, State then, String message) {
-        double dist = mc.player.position().distanceTo(pos.getCenter());
+        double dist = mc.player.position().distanceTo(Vec3.atCenterOf(pos));
         if (dist > MAX_PATH_DISTANCE) {
             Chat.warning("移动距离超过1000格, 功能关闭");
             this.toggle();
@@ -761,7 +761,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
 
     /** 玩家距离方块中心 (Lotus aj.a(BlockPos,double)) */
     private boolean fartherThan(BlockPos pos, double dist) {
-        return mc.player.position().distanceTo(pos.getCenter()) > dist;
+        return mc.player.position().distanceTo(Vec3.atCenterOf(pos)) > dist;
     }
 
     /**
@@ -779,7 +779,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
 
     /** 眼睛距离方块中心 (Lotus aj.b(BlockPos,double)) */
     private boolean eyeFartherThan(BlockPos pos, double dist) {
-        return mc.player.getEyePosition().distanceTo(pos.getCenter()) > dist;
+        return mc.player.getEyePosition().distanceTo(Vec3.atCenterOf(pos)) > dist;
     }
 
     /** 低处方块抬高到玩家脚部高度 (Lotus s_0.e(BlockPos)) */
@@ -859,7 +859,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
      */
     private boolean alignToBlockCenter(BlockPos pos) {
         // 界面开着时绝不按移动键 (会把界面交互搞乱)
-        if (mc.screen != null) {
+        if (mc.gui.screen() != null) {
             this.releaseAlignmentKeys();
             return false;
         }
@@ -1393,8 +1393,8 @@ public class CartographerModule extends Module implements AbstractGameEventListe
      * 只剩成品地图时转 PUT 入库 —— 挂机模式任何情况都不停机。
      */
     private void onSort() {
-        if (mc.screen != null) {
-            mc.setScreen(null);
+        if (mc.gui.screen() != null) {
+            mc.gui.setScreen(null);
         }
         if (this.mergePartialStacks()) {
             this.k();
@@ -1507,7 +1507,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
                 if (customName == null || !name.equals(customName.getString())) {
                     Chat.info("命名地图: %s", name);
                     anvilMenu.setItemName(name);
-                    if (mc.screen instanceof AnvilScreen anvilScreen) {
+                    if (mc.gui.screen() instanceof AnvilScreen anvilScreen) {
                         EditBox box = getAnvilNameBox(anvilScreen);
                         if (box != null) {
                             box.setValue(name);
@@ -1651,7 +1651,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
             }
             List<BlockPos> row = this.rows.get(this.rowIndex);
             int index = Math.clamp((long) this.columnIndex, 0, row.size() - 1);
-            Vec3 anchorCenter = row.get(index).getCenter();
+            Vec3 anchorCenter = Vec3.atCenterOf(row.get(index));
             Vec3 playerPos = mc.player.position();
             double best = Double.MAX_VALUE;
             BlockPos bestPos = null;
@@ -1661,7 +1661,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
                 List<BlockPos> points = this.supplyPoints.get(item);
                 if (points == null) continue;
                 for (BlockPos point : points) {
-                    Vec3 center = point.getCenter();
+                    Vec3 center = Vec3.atCenterOf(point);
                     double d = Math.min(anchorCenter.distanceTo(center), playerPos.distanceTo(center));
                     if (d >= best) continue;
                     best = d;
@@ -1737,7 +1737,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     private void startPrinter() {
         this.printer.setSupplier(() -> {
             if (this.anchor == null) return Collections.emptyList();
-            if (mc.player.position().distanceTo(this.anchor.getCenter()) > 10.0) return Collections.emptyList();
+            if (mc.player.position().distanceTo(Vec3.atCenterOf(this.anchor)) > 10.0) return Collections.emptyList();
             return this.placementPositions(this.anchor);   // d(O)
         });
         this.printer.activate();

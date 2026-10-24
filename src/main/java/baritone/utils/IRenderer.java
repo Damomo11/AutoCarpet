@@ -22,17 +22,25 @@ import baritone.api.Settings;
 import baritone.utils.accessor.IEntityRenderManager;
 import baritone.utils.accessor.IRenderPipelines;
 import baritone.utils.accessor.IRenderType;
+import com.mojang.blaze3d.PrimitiveTopology;
+import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.pipeline.BlendFunction;
 import com.mojang.blaze3d.pipeline.ColorTargetState;
 import com.mojang.blaze3d.pipeline.DepthStencilState;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
+import com.mojang.blaze3d.platform.BlendFactor;
 import com.mojang.blaze3d.platform.CompareOp;
-import com.mojang.blaze3d.platform.DestFactor;
-import com.mojang.blaze3d.platform.SourceFactor;
-import com.mojang.blaze3d.vertex.*;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.vertex.BufferBuilder;
+import com.mojang.blaze3d.vertex.ByteBufferBuilder;
+import com.mojang.blaze3d.vertex.DefaultVertexFormat;
+import com.mojang.blaze3d.vertex.MeshData;
+import com.mojang.blaze3d.vertex.PoseStack;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.BindGroupLayouts;
 import net.minecraft.client.renderer.RenderPipelines;
 import net.minecraft.client.renderer.blockentity.BeaconRenderer;
+import net.minecraft.client.renderer.rendertype.PreparedRenderType;
 import net.minecraft.client.renderer.rendertype.RenderSetup;
 import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.rendertype.RenderTypes;
@@ -45,16 +53,34 @@ import net.minecraft.world.phys.Vec3;
 import java.awt.*;
 import java.util.function.BiFunction;
 
+/**
+ * Ported to the Minecraft 26.2 render backend:
+ * <ul>
+ *     <li>{@code Tesselator} was removed; {@link BufferBuilder} is now constructed over a {@link ByteBufferBuilder}.</li>
+ *     <li>{@code VertexFormat.Mode} became {@link PrimitiveTopology}.</li>
+ *     <li>{@code SourceFactor}/{@code DestFactor} were merged into {@link BlendFactor}.</li>
+ *     <li>{@code RenderType#draw(MeshData)} was removed; this interface now provides a compatible
+ *     immediate-draw path built on {@link RenderType#prepare()} and {@link PreparedRenderType#drawFromBuffer}.</li>
+ * </ul>
+ */
 public interface IRenderer {
 
-    Tesselator tessellator = Tesselator.getInstance();
+    int INITIAL_BUFFER_SIZE = 786432; // RenderType.SMALL_BUFFER_SIZE
+
+    /**
+     * The {@link ByteBufferBuilder} backing the most recent {@link #begin(PrimitiveTopology, com.mojang.blaze3d.vertex.VertexFormat)}
+     * call. Rendering happens on a single thread and start/end pairs are strictly sequential,
+     * so one slot is sufficient; it is replaced (and closed) defensively on the next begin.
+     */
+    ThreadLocal<ByteBufferBuilder> ACTIVE_BYTE_BUFFER = new ThreadLocal<>();
+
     IEntityRenderManager renderManager = (IEntityRenderManager) Minecraft.getInstance().getEntityRenderDispatcher();
     Settings settings = BaritoneAPI.getSettings();
     BlendFunction BARITONE_LINES_BLEND = new BlendFunction(
-        SourceFactor.SRC_ALPHA,
-        DestFactor.ONE_MINUS_SRC_ALPHA,
-        SourceFactor.ONE,
-        DestFactor.ZERO
+        BlendFactor.SRC_ALPHA,
+        BlendFactor.ONE_MINUS_SRC_ALPHA,
+        BlendFactor.ONE,
+        BlendFactor.ZERO
     );
 
     RenderPipeline.Snippet BARITONE_LINES_SNIPPET = RenderPipeline.builder(((IRenderPipelines) new RenderPipelines()).getLinesSnippet())
@@ -66,8 +92,9 @@ public interface IRenderer {
     RenderPipeline.Snippet BARITONE_BEACON_BEAM_SNIPPET = RenderPipeline.builder(((IRenderPipelines) new RenderPipelines()).getMatricesFogSnippet())
             .withVertexShader("core/rendertype_beacon_beam")
             .withFragmentShader("core/rendertype_beacon_beam")
-            .withSampler("Sampler0")
-            .withVertexFormat(DefaultVertexFormat.BLOCK, VertexFormat.Mode.QUADS)
+            .withBindGroupLayout(BindGroupLayouts.SAMPLER0)
+            .withVertexBinding(0, DefaultVertexFormat.BLOCK)
+            .withPrimitiveTopology(PrimitiveTopology.QUADS)
             .buildSnippet();
 
     RenderPipeline BEACON_BEAM_OPAQUE = ((IRenderPipelines) new RenderPipelines()).baritone$registerPipeline(RenderPipeline.builder(BARITONE_BEACON_BEAM_SNIPPET)
@@ -90,7 +117,6 @@ public interface IRenderer {
             .withLocation("pipelines/baritone_lines_with_depth")
             .withDepthStencilState(new DepthStencilState(CompareOp.LESS_THAN_OR_EQUAL, false))
             .build())
-            .bufferSize(256)
             .createRenderSetup()
     );
     RenderType linesNoDepthRenderType = ((IRenderType) RenderTypes.lines()).createRenderType(
@@ -99,7 +125,6 @@ public interface IRenderer {
                 .withLocation("pipelines/baritone_lines_no_depth")
                 .withDepthStencilState(new DepthStencilState(CompareOp.ALWAYS_PASS, false))
                 .build())
-            .bufferSize(256)
             .createRenderSetup()
     );
 
@@ -123,9 +148,37 @@ public interface IRenderer {
         IRenderer.color[3] = alpha;
     }
 
+    static BufferBuilder begin(PrimitiveTopology topology, com.mojang.blaze3d.vertex.VertexFormat format) {
+        ByteBufferBuilder previous = ACTIVE_BYTE_BUFFER.get();
+        if (previous != null) {
+            // A previous begin/end pair was interrupted (e.g. an exception mid-render); don't leak it.
+            previous.close();
+        }
+        ByteBufferBuilder byteBufferBuilder = new ByteBufferBuilder(INITIAL_BUFFER_SIZE);
+        ACTIVE_BYTE_BUFFER.set(byteBufferBuilder);
+        return new BufferBuilder(byteBufferBuilder, topology, format);
+    }
+
+    /**
+     * Replacement for the removed {@code RenderType#draw(MeshData)}: uploads the mesh to a
+     * transient GPU buffer and issues an immediate draw with the render type's prepared state.
+     */
+    static void draw(RenderType renderType, MeshData meshData) {
+        if (meshData == null || meshData.drawState().vertexCount() == 0) {
+            return;
+        }
+        int indexCount = meshData.drawState().indexCount();
+        PreparedRenderType prepared = renderType.prepare();
+        try (GpuBuffer vertexBuffer = RenderSystem.getDevice().createBuffer(() -> "baritone vertex buffer", GpuBuffer.USAGE_VERTEX, meshData.vertexBuffer())) {
+            RenderSystem.AutoStorageIndexBuffer indices = RenderSystem.getSequentialBuffer(renderType.primitiveTopology());
+            GpuBuffer indexBuffer = indices.getBuffer(indexCount);
+            prepared.drawFromBuffer(vertexBuffer, indexBuffer, indices.type(), 0, 0, indexCount);
+        }
+    }
+
     static BufferBuilder startLines(Color color, float alpha) {
         glColor(color, alpha);
-        return tessellator.begin(VertexFormat.Mode.LINES, DefaultVertexFormat.POSITION_COLOR_NORMAL_LINE_WIDTH);
+        return begin(PrimitiveTopology.LINES, DefaultVertexFormat.POSITION_COLOR_NORMAL_LINE_WIDTH);
     }
 
     static BufferBuilder startLines(Color color) {
@@ -133,24 +186,26 @@ public interface IRenderer {
     }
 
     static void endLines(BufferBuilder bufferBuilder, boolean ignoredDepth) {
-        MeshData meshData = bufferBuilder.build();
-        if (meshData != null) {
-            if (ignoredDepth) {
-                linesNoDepthRenderType.draw(meshData);
-            } else {
-                linesWithDepthRenderType.draw(meshData);
-            }
-        }
+        endBuffer(bufferBuilder, ignoredDepth ? linesNoDepthRenderType : linesWithDepthRenderType);
     }
 
     static BufferBuilder startBlockQuads() {
-        return tessellator.begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.BLOCK);
+        return begin(PrimitiveTopology.QUADS, DefaultVertexFormat.BLOCK);
     }
 
     static void endBuffer(BufferBuilder bufferBuilder, RenderType renderType) {
         MeshData meshData = bufferBuilder.build();
-        if (meshData != null) {
-            renderType.draw(meshData);
+        ByteBufferBuilder byteBufferBuilder = ACTIVE_BYTE_BUFFER.get();
+        ACTIVE_BYTE_BUFFER.set(null);
+        try {
+            draw(renderType, meshData);
+        } finally {
+            if (meshData != null) {
+                meshData.close();
+            }
+            if (byteBufferBuilder != null) {
+                byteBufferBuilder.close();
+            }
         }
     }
 

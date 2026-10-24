@@ -35,12 +35,7 @@ public final class CarpetPalette {
             0x151515,   // black
     };
 
-    private static final Block[] BLOCKS = {
-            Blocks.WHITE_CARPET, Blocks.ORANGE_CARPET, Blocks.MAGENTA_CARPET, Blocks.LIGHT_BLUE_CARPET,
-            Blocks.YELLOW_CARPET, Blocks.LIME_CARPET, Blocks.PINK_CARPET, Blocks.GRAY_CARPET,
-            Blocks.LIGHT_GRAY_CARPET, Blocks.CYAN_CARPET, Blocks.PURPLE_CARPET, Blocks.BLUE_CARPET,
-            Blocks.BROWN_CARPET, Blocks.GREEN_CARPET, Blocks.RED_CARPET, Blocks.BLACK_CARPET,
-    };
+    private static final Block[] BLOCKS = Blocks.CARPET.asList().toArray(new Block[0]);
 
     /** 地毯无属性, defaultBlockState 即唯一状态 */
     public static BlockState state(int index) {

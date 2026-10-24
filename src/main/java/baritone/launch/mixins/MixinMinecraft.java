@@ -24,6 +24,7 @@ import baritone.api.event.events.TickEvent;
 import baritone.api.event.events.WorldEvent;
 import baritone.api.event.events.type.EventState;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.Gui;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
@@ -62,12 +63,13 @@ public class MixinMinecraft {
         BaritoneAPI.getProvider().getPrimaryBaritone();
     }
 
+    // 26.2: Minecraft#screen was moved into Gui (Gui#screen()); the tick() anchor is now the INVOKE
+    // of Gui#screen() that guards handleKeybinds (after the first missTime PUTFIELD).
     @Inject(
             method = "tick",
             at = @At(
-                    value = "FIELD",
-                    opcode = Opcodes.GETFIELD,
-                    target = "net/minecraft/client/Minecraft.screen:Lnet/minecraft/client/gui/screens/Screen;",
+                    value = "INVOKE",
+                    target = "Lnet/minecraft/client/gui/Gui;screen()Lnet/minecraft/client/gui/screens/Screen;",
                     ordinal = 0,
                     shift = At.Shift.BEFORE
             ),
@@ -75,7 +77,7 @@ public class MixinMinecraft {
                     from = @At(
                             value = "FIELD",
                             opcode = Opcodes.PUTFIELD,
-                            target = "net/minecraft/client/Minecraft.missTime:I"
+                            target = "Lnet/minecraft/client/Minecraft;missTime:I"
                     )
             )
     )
@@ -162,17 +164,18 @@ public class MixinMinecraft {
         );
     }
 
+    // 26.2: redirects Gui#screen() inside the overlay/keybinds guard instead of the removed
+    // Minecraft#screen field read.
     @Redirect(
             method = "tick",
             at = @At(
-                    value = "FIELD",
-                    opcode = Opcodes.GETFIELD,
-                    target = "Lnet/minecraft/client/Minecraft;screen:Lnet/minecraft/client/gui/screens/Screen;"
+                    value = "INVOKE",
+                    target = "Lnet/minecraft/client/gui/Gui;screen()Lnet/minecraft/client/gui/screens/Screen;"
             ),
             slice = @Slice(
                     from = @At(
                             value = "INVOKE",
-                            target = "Lnet/minecraft/client/gui/components/DebugScreenOverlay;showDebugScreen()Z"
+                            target = "Lnet/minecraft/client/gui/Gui;overlay()Lnet/minecraft/client/gui/screens/Overlay;"
                     ),
                     to = @At(
                             value = "CONSTANT",
@@ -180,12 +183,12 @@ public class MixinMinecraft {
                     )
             )
     )
-    private Screen passEvents(Minecraft instance) {
+    private Screen passEvents(Gui gui) {
         // allow user input is only the primary baritone
         if (BaritoneAPI.getProvider().getPrimaryBaritone().getPathingBehavior().isPathing() && player != null) {
             return null;
         }
-        return instance.screen;
+        return gui.screen();
     }
 
     // TODO

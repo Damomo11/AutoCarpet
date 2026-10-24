@@ -23,11 +23,8 @@ import baritone.api.utils.SettingsUtil;
 import baritone.api.utils.TypeUtils;
 import baritone.api.utils.gui.BaritoneToast;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.gui.components.ChatComponent;
-import net.minecraft.client.multiplayer.chat.GuiMessageTag;
 import net.minecraft.core.Vec3i;
 import net.minecraft.network.chat.Component;
-import net.minecraft.network.chat.MessageSignature;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
@@ -1277,13 +1274,8 @@ public final class Settings {
     @JavaOnly
     public final Setting<Consumer<Component>> logger = new Setting<>((msg) -> {
         try {
-            final GuiMessageTag tag = useMessageTag.value ? Helper.MESSAGE_TAG : null;
-            final ChatComponent chat = Minecraft.getInstance().gui.getChat();
-            if (tag != null) {
-                chat.addPlayerMessage(msg, new MessageSignature(new byte[MessageSignature.BYTES]), tag);
-            } else {
-                chat.addClientSystemMessage(msg);
-            }
+            // 26.2: Gui#getChat/ChatComponent client-side API was replaced by ChatListener#handleSystemMessage
+            Minecraft.getInstance().gui.chatListener().handleSystemMessage(msg, false);
         } catch (Throwable t) {
             LOGGER.warn("Failed to log message to chat: " + msg.getString(), t);
         }
