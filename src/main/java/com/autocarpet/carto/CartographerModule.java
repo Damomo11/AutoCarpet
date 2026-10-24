@@ -7,6 +7,8 @@ import baritone.api.event.events.PathEvent;
 import baritone.api.event.listener.AbstractGameEventListener;
 import baritone.api.pathing.goals.GoalNear;
 import baritone.api.process.ICustomGoalProcess;
+import baritone.api.utils.IInputOverrideHandler;
+import baritone.api.utils.input.Input;
 import com.autocarpet.module.Module;
 import com.autocarpet.module.Setting;
 import com.autocarpet.util.BlockActions;
@@ -85,7 +87,8 @@ import java.util.stream.Collectors;
  * -> TAKE_ITEM (补地毯) -> 补完后 SUPPLY (前往补给: 空地图/玻璃板/铁砧/经验瓶)
  * -> NEXT (打印机打印地毯画) -> 全部行打印完 finishAll「地毯打印完毕, 开始绘制地图」
  * -> SUPPLY -> DRAW 绘制空地图 -> LOCK 制图台锁定 -> NAME 铁砧命名 (原版 USE 态)
- * -> PUT 放入成品 -> 无成品后收尾 (移除投影/归档 momomap/加载下一张, 「暂停一会, 等待水收回...」)。
+ * -> PUT 放入成品 -> PUT_VERIFY 关箱原地等 5 秒复检背包 (仍有成品回 PUT 继续放)
+ * -> 确认放空后收尾 (移除投影/归档 momomap/加载下一张, 「暂停一会, 等待水收回...」)。
  * 投影原点必须是地图画的左上角 (128x128, 每 128 格一张地图)。
  */
 public class CartographerModule extends Module implements AbstractGameEventListener {
@@ -108,6 +111,10 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     private static final long OPEN_MAX_BACKOFF_MS = 4000;
     /** 开箱后等待容器内容同步的基础时间 (tick), 失败倍增, 上限为 4 倍 */
     private static final int DWELL_BASE_TICKS = 10;
+    /** 放入成品后关箱原地复检的等待时间 (tick), 100 = 5 秒 */
+    private static final int PUT_VERIFY_TICKS = 100;
+    /** 打印停滞持续多久触发模块整体重启 (tick), 1200 = 1 分钟 */
+    private static final int PRINT_STUCK_RESTART_TICKS = 1200;
 
     // ------------------------------------------------------------------
     // 状态机 (Lotus ag_0, 只保留制图师用到的状态)
@@ -135,6 +142,8 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         LOCK,
         /** 放入成品地图 */
         PUT,
+        /** 放入后确认: 关箱原地等待 5 秒再复检背包, 仍有成品则回 PUT 继续放 */
+        PUT_VERIFY,
         /** 背包整理 (合并同物品未满叠腾出空槽, 完成后回 TAKE_ITEM) */
         SORT,
         /** 铁砧命名成品地图 (原版 USE/au_0.I) */
@@ -192,6 +201,8 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     private int nextRow = -1;
     private int nextColumn = -1;
     private int nextStuckTicks;
+    /** 打印停滞首次告警的 tick (持续 1 分钟未恢复则整体重启模块), -1 表示当前未停滞 */
+    private long printStuckSinceTick = -1L;
     private int walkingTicks;
     private BlockPos lastGoal;
     private int lastGoalRange;
@@ -271,6 +282,9 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     /** 本轮会话中加载失败、已跳过的投影文件 */
     private final Set<Path> skippedFiles = new HashSet<>();
 
+    /** alignToBlockCenter 是否正在按移动键 (26.3 服务器禁止伪造坐标, 对齐改用真实按键) */
+    private boolean aligning;
+
     /** 投影打印机 (Lotus af 的投影打印模式) */
     public final CarpetPrinter printer = new CarpetPrinter(this);
 
@@ -318,6 +332,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         this.register(State.DRAW, this::onDraw);
         this.register(State.LOCK, this::onLock);
         this.register(State.PUT, this::onPut);
+        this.register(State.PUT_VERIFY, this::onPutVerify);
         this.register(State.SORT, this::onSort);
         this.register(State.NAME, this::onName);
         // ---- baritone 事件 (Lotus an 构造器) ----
@@ -373,6 +388,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         Chat.warning("制图师已关闭");
         this.state = State.NONE;
         this.cancelRestart();
+        this.releaseAlignmentKeys();
         baritone.getPathingBehavior().cancelEverything();
         if (this.baritoneSettingsCaptured) {
             baritoneSettings.antiCheatCompatibility.value = this.previousAntiCheat;
@@ -418,6 +434,10 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         if (mc.player == null || mc.level == null) return;
         // 非寻路状态不得残留任何真实视角目标 (放置/破坏一律走 PlaceUtils 静默旋转)
         if (this.state != State.WALKING) Rotations.clearTarget();
+        // 任何界面打开时: 松开对齐移动键, 打印机停手 (状态机照常跑, 开容器/命名必须点界面)
+        if (mc.screen != null) {
+            this.releaseAlignmentKeys();
+        }
         // 寻路兜底 (独立版保底出口): 正常到达/取消由 onPathEvent(CANCELED) 恢复;
         // 这里兜底事件丢失或寻路失败, 保证 WALKING 绝不无限卡死
         if (this.state == State.WALKING) {
@@ -459,8 +479,8 @@ public class CartographerModule extends Module implements AbstractGameEventListe
             }
         }
         // 打印机独立于状态机运行 (Lotus aj.onTickPost), 且在状态机之后 (原版 TickEvent.Pre -> Post 顺序),
-        // 状态机被延迟跳过时打印机照常运行
-        this.printer.tick();
+        // 状态机被延迟跳过时打印机照常运行; 界面打开时停手 (26.3 服务器上界面交互期间放方块会与移动包冲突)
+        if (mc.screen == null) this.printer.tick();
     }
 
     @Override
@@ -567,6 +587,18 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         this.delayedRestart(target, seconds);
     }
 
+    /**
+     * 整体重启模块: 等效于用户连按两次快捷键 (先关闭再开启)。
+     * 打印停滞的自救手段 (换位/重启 NEXT) 连续 1 分钟无法恢复时触发;
+     * 完整走 onDeactivate (关界面/停寻路/停打印机/还原设置) + onActivate (延迟重新加载投影从头打印)。
+     */
+    private void restartModule() {
+        Chat.warning("打印停滞持续超过 1 分钟, 重启制图师");
+        this.printStuckSinceTick = -1;
+        this.toggle();
+        this.toggle();
+    }
+
     // ---- 延迟跳转 (Lotus aj.a/b/c/y) ----
 
     private void delayedTransition(State target) {
@@ -642,6 +674,9 @@ public class CartographerModule extends Module implements AbstractGameEventListe
                 // 上一次 use 包后箱子没打开 (服务器卡顿), 重试间隔倍增: 1s -> 2s -> 4s (上限)
                 this.openBackoffMs = Math.min(this.openBackoffMs * 2, OPEN_MAX_BACKOFF_MS);
             }
+            // 开容器前先停寻路: 界面开着时 baritone 再推玩家会与开箱交互/移动包冲突
+            this.releaseAlignmentKeys();
+            baritone.getPathingBehavior().cancelEverything();
             if (side == null) {
                 PlaceUtils.openAuto(pos);
             } else {
@@ -818,26 +853,60 @@ public class CartographerModule extends Module implements AbstractGameEventListe
      * 水平对齐到锚点方块中心 (X+0.5, Z+0.5)。
      * 原版由 baritone 寻路把玩家停在方块中心再打印; 独立版寻路可能停在方块边缘,
      * 边缘站位到角落方块中心的距离会超出可及范围导致打不到。
-     * 每 tick 最多移动 0.05 格, 平滑不瞬移; 返回 true 表示已对齐 (偏差 <= 0.15)。
+     * 26.3 起服务器不接受伪造坐标 (setPos 的位置包服务端预测不了会被踢),
+     * 改用真实移动键走过去: 把方向分解到当前视角的前/右轴; 距离小于 0.6 格时
+     * 按住潜行 (30% 速度) 防走过头; 偏差 <=0.15 格松键返回 true。
      */
     private boolean alignToBlockCenter(BlockPos pos) {
+        // 界面开着时绝不按移动键 (会把界面交互搞乱)
+        if (mc.screen != null) {
+            this.releaseAlignmentKeys();
+            return false;
+        }
         double dx = pos.getX() + 0.5 - mc.player.getX();
         double dz = pos.getZ() + 0.5 - mc.player.getZ();
         double dist = Math.sqrt(dx * dx + dz * dz);
-        if (dist <= 0.15) return true;
-        double step = Math.min(0.05, dist);
-        mc.player.setPos(mc.player.getX() + dx / dist * step, mc.player.getY(), mc.player.getZ() + dz / dist * step);
-        mc.player.setDeltaMovement(Vec3.ZERO);
+        if (dist <= 0.15) {
+            this.releaseAlignmentKeys();
+            return true;
+        }
+        this.aligning = true;
+        // 目标方向按当前视角分解到前/右移动轴
+        float yawRad = mc.player.getYRot() * ((float) Math.PI / 180.0f);
+        double forward = -(dx * Math.sin(yawRad) + dz * Math.cos(yawRad));
+        double right = dx * Math.cos(yawRad) - dz * Math.sin(yawRad);
+        IInputOverrideHandler inputs = baritone.getInputOverrideHandler();
+        inputs.setInputForceState(Input.MOVE_FORWARD, forward > 0.2);
+        inputs.setInputForceState(Input.MOVE_BACK, forward < -0.2);
+        inputs.setInputForceState(Input.MOVE_LEFT, right < -0.2);
+        inputs.setInputForceState(Input.MOVE_RIGHT, right > 0.2);
+        // 距离近时按住潜行 (30% 速度) 防走过头
+        inputs.setInputForceState(Input.SNEAK, dist < 0.6);
         return false;
+    }
+
+    /** 松开对齐用过的全部移动键 (模块关闭/离开 NEXT/界面打开时强制调用) */
+    private void releaseAlignmentKeys() {
+        if (!this.aligning) return;
+        this.aligning = false;
+        IInputOverrideHandler inputs = baritone.getInputOverrideHandler();
+        inputs.setInputForceState(Input.MOVE_FORWARD, false);
+        inputs.setInputForceState(Input.MOVE_BACK, false);
+        inputs.setInputForceState(Input.MOVE_LEFT, false);
+        inputs.setInputForceState(Input.MOVE_RIGHT, false);
+        inputs.setInputForceState(Input.SNEAK, false);
     }
 
     /** NEXT (Lotus x): 巡检当前位置, 决定打印/移动/破坏; 原版 do-while 在同一 tick 内推进空锚点 */
     private void onNext() {
+        // 离开 NEXT 时不得残留对齐移动键
+        if (this.state != State.NEXT) this.releaseAlignmentKeys();
         // 卡住计数: 同一行同一列连续多次进入仍无进展时, 走兜底出口 (绝不无限卡死)
         if (this.nextRow == this.rowIndex && this.nextColumn == this.columnIndex) {
             this.nextStuckTicks++;
         } else {
             this.nextStuckTicks = 0;
+            this.printStuckSinceTick = -1;   // 锚点推进说明打印已恢复, 清掉停滞计时
             this.nextRow = this.rowIndex;
             this.nextColumn = this.columnIndex;
         }
@@ -934,6 +1003,12 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         }
         // 兜底出口: 同一锚点长时间无进展 (候选被拒/对齐后仍不可及等) -> 先按原版"可能挡住脚下了"逻辑换位, 仍不行按原版方式重启
         if (this.nextStuckTicks >= 20) {
+            // 打印停滞持续计时: 换位/重启 NEXT 等自救手段连续 1 分钟都没能让锚点推进时, 整体重启模块
+            if (this.printStuckSinceTick < 0) this.printStuckSinceTick = this.tickCounter;
+            if (this.tickCounter - this.printStuckSinceTick >= PRINT_STUCK_RESTART_TICKS) {
+                this.restartModule();
+                return;
+            }
             if (this.nextStuckTicks % 20 == 0) {
                 int[] moveOffsets = this.rowIndex % 2 == 0 ? new int[]{-1, -2, 1, 2} : new int[]{1, 1, -2};
                 for (int offset : moveOffsets) {
@@ -1162,11 +1237,11 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         }
     }
 
-    /** PUT (原版 C): 放入成品地图; 没有成品时收尾并加载下一张 */
+    /** PUT (原版 C): 放入成品地图; 没有成品时关箱等 5 秒复检, 确认没有才收尾加载下一张 */
     private void onPut() {
         ItemStack filled = this.scanInventory(stack -> stack.getItem() == Items.FILLED_MAP);
         if (filled.isEmpty()) {
-            this.finishPainting();
+            this.verifyPut();
             return;
         }
         // 不能用客户端 MapItemSavedData 判断锁定: 地图锁定后不再被手持, 客户端副本的 locked
@@ -1235,6 +1310,30 @@ public class CartographerModule extends Module implements AbstractGameEventListe
             InvUtils.shiftClickInv(this.invScanSlot());
             this.d(this.putRetryTicks > 0 ? this.putRetryTicks : this.actionDelay.get());
         });
+    }
+
+    /**
+     * 放入完成后的二次确认: 关闭输出箱, 原地等待 5 秒让服务器同步背包, 再复检是否仍有成品地图。
+     * 服务器卡顿时客户端可能短暂显示已放空, 直接收尾会把同步回来的成品漏在背包里。
+     */
+    private void verifyPut() {
+        Chat.info("放入完成, 关闭箱子等待 5 秒复检背包...");
+        this.lastPutCount = -1;
+        this.delayedState = State.PUT_VERIFY;
+        this.closeScreenTransition();   // 关闭输出箱界面并转入 PUT_VERIFY
+        this.d(PUT_VERIFY_TICKS);
+    }
+
+    /** PUT_VERIFY: 关箱等待 5 秒后复检背包, 仍有成品地图则回 PUT 继续放, 确认没有才收尾 */
+    private void onPutVerify() {
+        ItemStack filled = this.scanInventory(stack -> stack.getItem() == Items.FILLED_MAP);
+        if (!filled.isEmpty()) {
+            Chat.warning("复检发现背包仍有地图画, 继续放入");
+            this.state = State.PUT;
+            this.k();
+            return;
+        }
+        this.finishPainting();
     }
 
     /**
@@ -1454,9 +1553,10 @@ public class CartographerModule extends Module implements AbstractGameEventListe
                 this.state = State.SUPPLY;
                 return;
             }
+            // 目标格本身是空气就直接发放置包: 夹层结构 6 邻全是玻璃, 邻块检查只会白白挡住发包
             Chat.info("补放铁砧");
             InvUtils.swapWithSelected(anvil.slot);
-            PlaceUtils.placeFromHotbar(this.anvilPos, mc.player.getInventory().getSelectedSlot(), true, Direction.DOWN);
+            PlaceUtils.placeFromHotbar(this.anvilPos, mc.player.getInventory().getSelectedSlot(), false, Direction.DOWN);
             this.k();
             return;
         }
@@ -1487,6 +1587,24 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     private boolean anvilPlaced() {
         return this.anvilPos != null && mc.level != null
                 && mc.level.getBlockState(this.anvilPos).getBlock() instanceof AnvilBlock;
+    }
+
+    // ---- 调试命令支持 (临时, /acdebug) ----
+
+    public State debugState() {
+        return this.state;
+    }
+
+    public BlockPos debugMapCenter() {
+        return this.mapCenter;
+    }
+
+    public BlockPos debugAnvilPos() {
+        return this.anvilPos;
+    }
+
+    public boolean debugAnvilPlaced() {
+        return this.anvilPlaced();
     }
 
     /**
@@ -2026,6 +2144,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         this.pendingState = null;
         this.delayedState = State.NONE;
         this.nextStuckTicks = 0;
+        this.printStuckSinceTick = -1L;
         this.walkingTicks = 0;
         this.lastGoal = null;
     }

@@ -34,6 +34,7 @@ dependencies {
     include("dev.babbaj:nether-pathfinder:1.4.1")
     compileOnly("com.google.code.findbugs:jsr305:3.0.2")
     compileOnly(files("libs/fabric-api-base-2.0.3+ece063234c.jar", "libs/fabric-key-mapping-api-v1-2.0.4+e2bdee784c.jar", "libs/fabric-lifecycle-events-v1-4.1.1+df84eb3d4c.jar"))
+    compileOnly(files("C:/Users/29452/.gradle/caches/modules-2/files-2.1/net.fabricmc.fabric-api/fabric-command-api-v2/3.0.5+e2bdee784c/d2bfa62e2f489900be2210dfb84458dcdecb75b6/fabric-command-api-v2-3.0.5+e2bdee784c.jar"))
     compileOnly("net.fabricmc.fabric-api:fabric-networking-api-v1:4.3.0+ece063234c")
     compileOnly("com.terraformersmc:modmenu:18.0.0")
 }

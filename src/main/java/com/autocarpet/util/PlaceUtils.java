@@ -49,7 +49,7 @@ import java.util.Set;
 
 /**
  * 方块放置/交互工具 (移植自 Lotus ap_0 + av_0 中制图师与打印机用到的部分)。
- * 旋转通过 ServerboundMovePlayerPacket.PosRot 包同步, 交互通过 mc.gameMode.useItemOn。
+ * 旋转通过 ServerboundMovePlayerPacket.Rot 包同步 (26.3 服务器禁止一 tick 多个位置包), 交互通过 mc.gameMode.useItemOn。
  */
 public class PlaceUtils {
     private static final Minecraft mc = Minecraft.getInstance();
@@ -71,13 +71,18 @@ public class PlaceUtils {
     }
 
     /**
-     * 静默旋转 (Lotus bk.a(float,float)): 只发送 ServerboundMovePlayerPacket$PosRot 数据包,
+     * 静默旋转 (Lotus bk.a(float,float)): 只发送 ServerboundMovePlayerPacket$Rot 数据包,
      * 不修改玩家真实视角 (不调 setYRot/setYHeadRot/setXRot), 放置/破坏/开容器专用。
+     *
+     * 26.3 起原版服务器每个客户端 tick 只接受一个带坐标的移动包 (Pos/PosRot), 第二个
+     * 直接以 invalid_player_movement 踢出; 打印一 tick 可放多个方块, 必须用不带坐标的 Rot。
      */
     public static void packetRotate(float yaw, float pitch) {
-        mc.getConnection().send(new ServerboundMovePlayerPacket.PosRot(
-                mc.player.getX(), mc.player.getY(), mc.player.getZ(),
-                yaw, pitch, mc.player.onGround(), mc.player.horizontalCollision));
+        if (mc.getConnection() == null || mc.player == null) return;
+        if (!Float.isFinite(yaw) || !Float.isFinite(pitch)) return;
+        mc.getConnection().send(new ServerboundMovePlayerPacket.Rot(
+                Mth.wrapDegrees(yaw), Mth.clamp(pitch, -90.0f, 90.0f),
+                mc.player.onGround(), mc.player.horizontalCollision));
     }
 
     public static void packetRotate(Vec3 target) {
