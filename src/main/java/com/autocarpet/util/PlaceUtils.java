@@ -242,7 +242,7 @@ public class PlaceUtils {
     /** 找一个空气侧面来打开方块 (Lotus ap_0.j(BlockPos)) */
     public static Direction chooseSideByAir(BlockPos pos) {
         Vec3 eye = mc.player.getEyePosition();
-        Set<Direction> sides = sidesToward(eye, pos.getCenter());
+        Set<Direction> sides = sidesToward(eye, Vec3.atCenterOf(pos));
         Direction bestAir = null;
         double bestAirDist = Double.MAX_VALUE;
         Direction bestReplaceable = null;
@@ -250,7 +250,7 @@ public class PlaceUtils {
         for (Direction side : sides) {
             BlockPos neighbor = pos.relative(side);
             BlockState neighborState = mc.level.getBlockState(neighbor);
-            Vec3 faceCenter = pos.getCenter().add(side.getStepX() * 0.5, side.getStepY() * 0.5, side.getStepZ() * 0.5);
+            Vec3 faceCenter = Vec3.atCenterOf(pos).add(side.getStepX() * 0.5, side.getStepY() * 0.5, side.getStepZ() * 0.5);
             double dist = eye.distanceToSqr(faceCenter);
             if (neighborState.isAir()) {
                 if (dist < bestAirDist) {
@@ -267,7 +267,7 @@ public class PlaceUtils {
 
     /** 找最佳可点击面: 面向玩家、邻块实心、射线畅通 (Lotus ap_0.h(BlockPos)) */
     public static Direction getDirectionEye(BlockPos pos) {
-        Set<Direction> sides = sidesToward(mc.player.getEyePosition(), pos.getCenter());
+        Set<Direction> sides = sidesToward(mc.player.getEyePosition(), Vec3.atCenterOf(pos));
         for (Direction dir : Direction.values()) {
             BlockState neighborState = mc.level.getBlockState(pos.relative(dir));
             if (neighborState.isAir() || neighborState.getBlock() instanceof LiquidBlock) continue;
@@ -284,7 +284,7 @@ public class PlaceUtils {
         Direction best = null;
         double bestDist = Double.MAX_VALUE;
         Vec3 eye = mc.player.getEyePosition();
-        Set<Direction> sides = sidesToward(eye, pos.getCenter());
+        Set<Direction> sides = sidesToward(eye, Vec3.atCenterOf(pos));
         for (Direction dir : Direction.values()) {
             BlockPos neighbor = pos.relative(dir);
             if (!sides.contains(dir.getOpposite())) continue;
@@ -373,7 +373,7 @@ public class PlaceUtils {
 
     /** 点击 pos 的 side 面, 命中点 = pos 中心 + offset (Lotus ap_0.b(BlockPos, Direction, Vec3)) */
     public static boolean placeOnFace(BlockPos pos, Direction side, Vec3 offset) {
-        Vec3 hitVec = pos.getCenter().add(offset);
+        Vec3 hitVec = Vec3.atCenterOf(pos).add(offset);
         packetRotate(hitVec);
         return interact(new BlockHitResult(hitVec, side, pos, false));
     }
@@ -425,7 +425,7 @@ public class PlaceUtils {
      * 命中点 = hitSource 中心 + offset (带视线校正), 玩家朝向 clickSide。
      */
     public static boolean placeWithOffset(BlockPos clickPos, BlockPos hitSource, Direction face, Direction clickSide, Vec3 offset) {
-        Vec3 hitVec = adjustHitForEye(hitSource.getCenter().add(offset), face);
+        Vec3 hitVec = adjustHitForEye(Vec3.atCenterOf(hitSource).add(offset), face);
         packetRotate(yawFor(clickSide), clickSide == Direction.UP ? -90.0f : clickSide == Direction.DOWN ? 90.0f : 5.0f);
         return interact(new BlockHitResult(hitVec, face, clickPos, false));
     }
@@ -455,7 +455,7 @@ public class PlaceUtils {
 
     /** 半砖用面选择 (Lotus ap_0.b(BlockPos, boolean)) */
     public static Direction chooseSlabSide(BlockPos pos, boolean top) {
-        Set<Direction> sides = sidesToward(mc.player.getEyePosition(), pos.getCenter());
+        Set<Direction> sides = sidesToward(mc.player.getEyePosition(), Vec3.atCenterOf(pos));
         if (sides.remove(Direction.DOWN) && top && mc.level.getBlockState(pos.above()).canBeReplaced()) {
             return Direction.DOWN;
         }
@@ -540,13 +540,13 @@ public class PlaceUtils {
 
     /** 立方体范围点 (Lotus ap_0.a(int, BlockPos)) */
     public static List<BlockPos> spherePositions(int range, BlockPos center) {
-        Vec3 centerVec = center.getCenter();
+        Vec3 centerVec = Vec3.atCenterOf(center);
         List<BlockPos> list = new ArrayList<>();
         for (int x = center.getX() - range; x < center.getX() + range; x++) {
             for (int z = center.getZ() - range; z < center.getZ() + range; z++) {
                 for (int y = center.getY() - range; y < center.getY() + range; y++) {
                     BlockPos pos = new BlockPos(x, y, z);
-                    if (pos.getCenter().distanceTo(centerVec) > range || list.contains(pos)) continue;
+                    if (Vec3.atCenterOf(pos).distanceTo(centerVec) > range || list.contains(pos)) continue;
                     list.add(pos);
                 }
             }

@@ -57,7 +57,7 @@ public class AutoCarpet implements ClientModInitializer {
 
     private void onTick(Minecraft mc) {
         while (this.openConfig.consumeClick()) {
-            if (mc.screen == null) mc.setScreen(new ConfigScreen(null));
+            if (mc.gui.screen() == null) mc.gui.setScreen(new ConfigScreen(null));
         }
         while (this.toggleCartographer.consumeClick()) {
             for (Module module : this.modules) {
@@ -72,11 +72,11 @@ public class AutoCarpet implements ClientModInitializer {
                 // 真实视角只在 baritone 寻路行走 (WALKING) 时跟随行走方向;
                 // 打印相关状态 (READY/NEXT/OPEN_PRINTER/BREAK/放置/破坏) 完全不改真实视角 (静默包旋转)
                 // 界面打开时完全停手 (26.3 服务器上界面交互期间的额外动作会与移动包冲突)
-                if (cartographer.isWalkingState() && mc.screen == null) Rotations.tick();
+                if (cartographer.isWalkingState() && mc.gui.screen() == null) Rotations.tick();
                 break;
             }
         }
-        if (mc.screen == null) BlockActions.tickBreaking();
+        if (mc.gui.screen() == null) BlockActions.tickBreaking();
         if (mc.player == null || mc.level == null) {
             for (Module module : this.modules) {
                 if (module.enabled) module.toggle();

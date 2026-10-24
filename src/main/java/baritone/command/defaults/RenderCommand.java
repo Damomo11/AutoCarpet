@@ -22,6 +22,8 @@ import baritone.api.command.Command;
 import baritone.api.command.argument.IArgConsumer;
 import baritone.api.command.exception.CommandException;
 import baritone.api.utils.BetterBlockPos;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.core.SectionPos;
 
 import java.util.Arrays;
 import java.util.List;
@@ -38,14 +40,17 @@ public class RenderCommand extends Command {
         args.requireMax(0);
         BetterBlockPos origin = ctx.playerFeet();
         int renderDistance = (ctx.minecraft().options.renderDistance().get() + 1) * 16;
-        ctx.minecraft().levelRenderer.setBlocksDirty(
-                origin.x - renderDistance,
-                ctx.world().getMinY(),
-                origin.z - renderDistance,
-                origin.x + renderDistance,
-                ctx.world().getMaxY(),
-                origin.z + renderDistance
-        );
+        // 26.2: LevelRenderer#setBlocksDirty was replaced by ClientLevel#setSectionRangeDirty (section coords)
+        if (ctx.world() instanceof ClientLevel level) {
+            level.setSectionRangeDirty(
+                    SectionPos.blockToSectionCoord(origin.x - renderDistance),
+                    level.getMinSectionY(),
+                    SectionPos.blockToSectionCoord(origin.z - renderDistance),
+                    SectionPos.blockToSectionCoord(origin.x + renderDistance),
+                    level.getMaxSectionY(),
+                    SectionPos.blockToSectionCoord(origin.z + renderDistance)
+            );
+        }
         logDirect("Done");
     }
 

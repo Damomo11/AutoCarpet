@@ -171,7 +171,8 @@ public class CarpetPrinter {
             PrintTarget target = list.get((this.scanCursor + i) % size);
             advanced++;
             BlockPos pos = target.pos;
-            if (pos.getY() > DataManager.getRenderLayerRange().getLayerMax()) continue;
+            // 26.2 (litematica 0.28 / malilib 0.29): LayerRange moved to malilib and getLayerMax() → getMaxLayerBoundary()
+            if (pos.getY() > DataManager.getRenderLayerRange().getMaxLayerBoundary()) continue;
             BlockState current = target.current;
             if (PlaceUtils.isSolid(current)) continue;
             if ((module.placeTimeout.get() != 0 && this.cooldowns.containsKey(pos)) || !current.canBeReplaced()) continue;

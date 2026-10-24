@@ -42,7 +42,7 @@ public class ConfigScreen extends Screen {
         }).bounds(this.width / 2 - 100, 28, 200, 20).build();
         this.addRenderableWidget(this.moduleToggle);
         this.addRenderableWidget(Button.builder(Component.literal("图片生成投影"), button ->
-                        this.minecraft.setScreen(new com.autocarpet.img.ImageToSchematicScreen(this)))
+                        this.minecraft.gui.setScreen(new com.autocarpet.img.ImageToSchematicScreen(this)))
                 .bounds(this.width / 2 - 100, 50, 200, 20).build());
         refreshSettingWidgets();
         this.addRenderableWidget(Button.builder(Component.literal("关闭"), button -> this.onClose())
@@ -164,6 +164,6 @@ public class ConfigScreen extends Screen {
     @Override
     public void onClose() {
         AutoCarpet.get().config.save();
-        this.minecraft.setScreen(this.parent);
+        this.minecraft.gui.setScreen(this.parent);
     }
 }
