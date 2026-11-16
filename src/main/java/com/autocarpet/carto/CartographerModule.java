@@ -115,6 +115,8 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     private static final int PUT_VERIFY_TICKS = 100;
     /** 打印停滞持续多久触发模块整体重启 (tick), 1200 = 1 分钟 */
     private static final int PRINT_STUCK_RESTART_TICKS = 1200;
+    /** 对齐无进展多久后放弃对齐放行打印 (tick), 40 = 2 秒 */
+    private static final int ALIGN_GIVE_UP_TICKS = 40;
 
     // ------------------------------------------------------------------
     // 状态机 (Lotus ag_0, 只保留制图师用到的状态)
@@ -284,6 +286,10 @@ public class CartographerModule extends Module implements AbstractGameEventListe
 
     /** alignToBlockCenter 是否正在按移动键 (26.3 服务器禁止伪造坐标, 对齐改用真实按键) */
     private boolean aligning;
+    /** 本次对齐达到过的最小水平距离 (用于判断对齐是否仍有进展) */
+    private double alignBestDist = Double.MAX_VALUE;
+    /** 对齐无进展的连续 tick 数 (超过上限就放行打印, 绝不永久卡在对齐里) */
+    private int alignStuckTicks;
 
     /** 投影打印机 (Lotus af 的投影打印模式) */
     public final CarpetPrinter printer = new CarpetPrinter(this);
@@ -550,6 +556,7 @@ public class CartographerModule extends Module implements AbstractGameEventListe
     }
 
     private void startPath(BlockPos pos, int range) {
+        this.releaseAlignmentKeys();   // 换目标前不得残留对齐移动键, 否则会和寻路按键打架
         this.lastGoal = new BlockPos(pos);
         this.lastGoalRange = range;
         goalProcess.setGoalAndPath(new GoalNear(pos, range));
@@ -868,18 +875,35 @@ public class CartographerModule extends Module implements AbstractGameEventListe
         double dist = Math.sqrt(dx * dx + dz * dz);
         if (dist <= 0.15) {
             this.releaseAlignmentKeys();
+            this.alignBestDist = Double.MAX_VALUE;
+            this.alignStuckTicks = 0;
+            return true;
+        }
+        // 对齐无进展保护: 距离不再缩小 (被方块挡住/卡住) 时计数, 超时后放弃对齐放行打印,
+        // 否则脚下没打印的方块会把玩家永远卡在对齐循环里 (表现为一直蹲着不动)
+        if (dist < this.alignBestDist - 0.01) {
+            this.alignBestDist = dist;
+            this.alignStuckTicks = 0;
+        } else if (++this.alignStuckTicks > ALIGN_GIVE_UP_TICKS) {
+            this.releaseAlignmentKeys();
+            this.alignBestDist = Double.MAX_VALUE;
+            this.alignStuckTicks = 0;
+            Chat.warning("对齐无进展, 放弃对齐继续打印");
             return true;
         }
         this.aligning = true;
-        // 目标方向按当前视角分解到前/右移动轴
+        // 目标方向按当前视角分解到前/左移动轴
+        // (视角向量: (-sin(yaw), cos(yaw)); MOVE_LEFT 沿其左手方向 (+cos, +sin) 推导)
         float yawRad = mc.player.getYRot() * ((float) Math.PI / 180.0f);
-        double forward = -(dx * Math.sin(yawRad) + dz * Math.cos(yawRad));
-        double right = dx * Math.cos(yawRad) - dz * Math.sin(yawRad);
+        float sin = (float) Math.sin(yawRad);
+        float cos = (float) Math.cos(yawRad);
+        double forward = dx * -sin + dz * cos;
+        double left = dx * cos + dz * sin;
         IInputOverrideHandler inputs = baritone.getInputOverrideHandler();
-        inputs.setInputForceState(Input.MOVE_FORWARD, forward > 0.2);
-        inputs.setInputForceState(Input.MOVE_BACK, forward < -0.2);
-        inputs.setInputForceState(Input.MOVE_LEFT, right < -0.2);
-        inputs.setInputForceState(Input.MOVE_RIGHT, right > 0.2);
+        inputs.setInputForceState(Input.MOVE_FORWARD, forward > 0.1);
+        inputs.setInputForceState(Input.MOVE_BACK, forward < -0.1);
+        inputs.setInputForceState(Input.MOVE_LEFT, left > 0.1);
+        inputs.setInputForceState(Input.MOVE_RIGHT, left < -0.1);
         // 距离近时按住潜行 (30% 速度) 防走过头
         inputs.setInputForceState(Input.SNEAK, dist < 0.6);
         return false;
@@ -887,6 +911,8 @@ public class CartographerModule extends Module implements AbstractGameEventListe
 
     /** 松开对齐用过的全部移动键 (模块关闭/离开 NEXT/界面打开时强制调用) */
     private void releaseAlignmentKeys() {
+        this.alignBestDist = Double.MAX_VALUE;
+        this.alignStuckTicks = 0;
         if (!this.aligning) return;
         this.aligning = false;
         IInputOverrideHandler inputs = baritone.getInputOverrideHandler();
